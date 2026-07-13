@@ -60,6 +60,10 @@ logger = get_inductor_logger("work_division")
 # Maximum memory access span per core: 256MB hardware limit
 MAX_SPAN_BYTES = 256 * 1024 * 1024
 
+MAX_L3_MVLOOPCNT = 65535
+L3_MVLOOP_ITER_BYTES = 4096
+MAX_L3_MVLOOP_SPAN_BYTES = MAX_L3_MVLOOPCNT * L3_MVLOOP_ITER_BYTES
+
 
 @dataclasses.dataclass
 class TensorDep:
@@ -434,9 +438,8 @@ def must_split_vars(
     accumulated_splits: dict[Symbol, int] = {}
 
     for td in tensor_deps:
-        if (
-            get_per_core_span(td, accumulated_splits, it_space_orig, symbol_meta)
-            <= MAX_SPAN_BYTES
+        if get_per_core_span(td, accumulated_splits, it_space_orig, symbol_meta) <= min(
+            MAX_SPAN_BYTES, MAX_L3_MVLOOP_SPAN_BYTES
         ):
             continue
 
@@ -502,7 +505,7 @@ def must_split_vars(
 
                 span = get_per_core_span(td, trial, it_space_orig, symbol_meta)
 
-                if span <= MAX_SPAN_BYTES:
+                if span <= min(MAX_SPAN_BYTES, MAX_L3_MVLOOP_SPAN_BYTES):
                     if best_within is None or span > best_within[0]:
                         best_within = (span, combo)
                 else:
@@ -524,7 +527,7 @@ def must_split_vars(
             for v, s in zip(split_vars, best_combo):
                 accumulated_splits[v] = s
 
-            if best_span <= MAX_SPAN_BYTES:
+            if best_span <= min(MAX_SPAN_BYTES, MAX_L3_MVLOOP_SPAN_BYTES):
                 break
 
             # Still above the limit. If this coord still evaluates to > 1 under
@@ -552,7 +555,7 @@ def must_split_vars(
                     f"Cannot satisfy span limit for tensor {td.dep.name}: "
                     f"coord={coord} still evaluates to {per_core_coord_size} after splits. "
                     f"Inner dimensions cannot reduce span further. "
-                    f"Best span={best_span}, limit={MAX_SPAN_BYTES}."
+                    f"Best span={best_span}, limit={min(MAX_SPAN_BYTES, MAX_L3_MVLOOP_SPAN_BYTES)}."
                 )
                 break
 
