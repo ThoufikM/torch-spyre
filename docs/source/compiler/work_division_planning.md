@@ -19,7 +19,7 @@ scratchpad planning) consume that plan.
 ## Three-pass planner overview
 
 The planner has three responsibilities, one per pass: **Pass 1
-enforces the 255.996 MB per-core span limit, Pass 2 selects matmul splits
+enforces the 255.996 MiB per-core span limit, Pass 2 selects matmul splits
 from a cost model, and Pass 3 selects a default split for every other
 eligible op.**
 

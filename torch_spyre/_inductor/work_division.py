@@ -385,7 +385,6 @@ def warn_if_per_core_overflow(
     op_name: str,
     symbol_meta: SymbolMeta,
 ) -> None:
-    print(splits)
     """Log CRITICAL if any tensor's per-core memory span exceeds MAX_SPAN_BYTES."""
     for td in tensor_deps:
         per_core_span = get_per_core_span(td, splits, it_space_orig, symbol_meta)
@@ -883,7 +882,7 @@ def span_reduction_pass(
     if len(reduction_vars_to_split) > 1:
         raise Unsupported(
             f"Cannot satisfy hardware memory span limit "
-            f"{MAX_SPAN_BYTES / (1024**2):.3f}MB) without splitting "
+            f"({MAX_SPAN_BYTES / (1024**2):.3f})MB without splitting "
             f"{len(reduction_vars_to_split)} reduction dimension(s) "
             f"({reduction_vars_to_split}), but the backend supports at most 1."
         )
