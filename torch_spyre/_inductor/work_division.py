@@ -882,7 +882,7 @@ def span_reduction_pass(
     if len(reduction_vars_to_split) > 1:
         raise Unsupported(
             f"Cannot satisfy hardware memory span limit "
-            f"({MAX_SPAN_BYTES / (1024**2):.3f})MB without splitting "
+            f"({MAX_SPAN_BYTES / (1024**2):.3f}MB) without splitting "
             f"{len(reduction_vars_to_split)} reduction dimension(s) "
             f"({reduction_vars_to_split}), but the backend supports at most 1."
         )
