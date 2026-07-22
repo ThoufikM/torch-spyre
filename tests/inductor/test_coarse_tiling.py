@@ -4246,5 +4246,105 @@ class TestHintsToCoarseTileGroupsLogging(unittest.TestCase):
         )
 
 
+class TestRepairUnitTiledSymbols(unittest.TestCase):
+    def test_repairs_empty_tiled_level_from_unit_tiled_host_dim(self):
+        from torch_spyre._inductor.op_spec import OpSpec
+        from torch_spyre._inductor.spyre_kernel import _repair_unit_tiled_symbols
+
+        c0 = Symbol("c0")
+        c1 = Symbol("c1")
+        z0 = Symbol("z0")
+        z1 = Symbol("z1")
+        op_spec = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={c0: (Integer(16), 1), c1: (Integer(64), 1)},
+            args=[],
+            op_info={},
+            tiled_symbols=[[]],
+            unit_tiled_host_dims=[[1]],
+        )
+        new_space = {
+            c0: (Integer(16), 1),
+            c1: (Integer(64), 1),
+            z0: (Integer(1), 1),
+            z1: (Integer(1), 1),
+        }
+        new_tensors = [
+            {
+                "size": [Integer(1), Integer(1), Integer(16), Integer(64)],
+                "coordinates": [z0, z1, c0, c1],
+            }
+        ]
+
+        _repair_unit_tiled_symbols(
+            op_spec, op_spec.iteration_space, new_space, new_tensors
+        )
+
+        self.assertEqual(op_spec.tiled_symbols, [[z1]])
+
+    def test_creates_synthetic_symbol_for_constant_unit_tiled_host_dim(self):
+        from torch_spyre._inductor.op_spec import OpSpec
+        from torch_spyre._inductor.spyre_kernel import _repair_unit_tiled_symbols
+
+        c0 = Symbol("c0")
+        c1 = Symbol("c1")
+        z0 = Symbol("z0")
+        z1 = Symbol("z1")
+        op_spec = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={c0: (Integer(16), 1), c1: (Integer(64), 1)},
+            args=[],
+            op_info={},
+            tiled_symbols=[[]],
+            unit_tiled_host_dims=[[1]],
+        )
+        new_space = {
+            c0: (Integer(16), 1),
+            c1: (Integer(64), 1),
+            z0: (Integer(1), 1),
+        }
+        new_tensors = [
+            {
+                "size": [Integer(1), Integer(1), Integer(16), Integer(64)],
+                "coordinates": [z0, Integer(0), c0, c1],
+            }
+        ]
+
+        _repair_unit_tiled_symbols(
+            op_spec, op_spec.iteration_space, new_space, new_tensors
+        )
+
+        self.assertEqual(op_spec.tiled_symbols, [[z1]])
+        self.assertIn(z1, new_space)
+        self.assertEqual(new_tensors[-1]["coordinates"][1], z1)
+
+    def test_does_not_repair_without_unit_tile_marker(self):
+        from torch_spyre._inductor.op_spec import OpSpec
+        from torch_spyre._inductor.spyre_kernel import _repair_unit_tiled_symbols
+
+        c0 = Symbol("c0")
+        z0 = Symbol("z0")
+        op_spec = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={c0: (Integer(16), 1)},
+            args=[],
+            op_info={},
+            tiled_symbols=[[]],
+        )
+        new_space = {c0: (Integer(16), 1), z0: (Integer(1), 1)}
+        new_tensors = [
+            {"size": [Integer(20), Integer(16)], "coordinates": [z0, c0]}
+        ]
+
+        _repair_unit_tiled_symbols(
+            op_spec, op_spec.iteration_space, new_space, new_tensors
+        )
+
+        self.assertEqual(op_spec.tiled_symbols, [[]])
+
+
 if __name__ == "__main__":
     unittest.main()

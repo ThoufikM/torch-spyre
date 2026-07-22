@@ -153,6 +153,10 @@ class OpSpec:
             The bundle path (compile_op_spec / generate_sdsc) reverses this list to
             outermost-first and builds per-level affine.apply stride maps, mapping
             each level's strides to the correct loop variable by explicit index.
+        unit_tiled_host_dims: Per-loop-level host dimension indices, innermost
+            first, for coarse-tiled output dims whose per-tile range became 1
+            and were therefore omitted from the pre-alignment iteration space.
+            Empty entries mean no repair is needed for that level.
     """
 
     op: str
@@ -161,6 +165,9 @@ class OpSpec:
     args: Sequence[TensorArg]
     op_info: dict[str, Any]
     tiled_symbols: list[list[Symbol]] = dataclasses.field(default_factory=list)
+    unit_tiled_host_dims: list[list[int]] = dataclasses.field(
+        default_factory=list
+    )
     # Maps PyTorch symbol name (e.g. 's97') -> (max, granularity) bounds.
     # Populated by compute_symbolic_bounds during
     # create_op_spec; empty for concrete dims.
