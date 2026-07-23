@@ -112,6 +112,7 @@ def _resize_device_layout(
     old_host_size: list[int],
     new_host_size: list[int],
     stick_host_dim: int | None = None,
+    preserve_unit_host_dims: set[int] | None = None,
 ):
     """Derive a new SpyreTensorLayout for a resized host buffer.
 
@@ -197,6 +198,7 @@ def _resize_device_layout(
     eps = orig_stl.elems_per_stick()
     ndev = len(orig_sm)
     ndim = len(old_host_size)
+    preserve_unit_host_dims = preserve_unit_host_dims or set()
 
     # Trust a caller-provided stick_host_dim only when it is consistent with the
     # device tile-count structure: the stick host dim must have a corresponding
@@ -229,7 +231,17 @@ def _resize_device_layout(
             # The authoritative stick host dim is never a non-stick match.
             if stick_host_dim is not None:
                 size1_cands = [p for p in size1_cands if p != stick_host_dim]
-            if len(size1_cands) == 1:
+            preserved_cands = [
+                p
+                for p in size1_cands
+                if p in preserve_unit_host_dims
+                and new_host_size[p] != old_host_size[p]
+                and orig_sm[j] != -1
+                and (orig_sm[j] == old_hs[p] or orig_sm[j] == new_hs[p])
+            ]
+            if len(preserved_cands) == 1:
+                matched_host[j] = preserved_cands[0]
+            elif len(size1_cands) == 1:
                 matched_host[j] = size1_cands[0]
             # else: sparse placeholder with no host counterpart — skip silently.
         else:
@@ -321,7 +333,13 @@ def _resize_device_layout(
     for j, p in matched_host.items():
         new_ds[j] = new_host_size[p]
         if new_host_size[p] == 1:
-            new_sm[j] = -1
+            if p in preserve_unit_host_dims:
+                if orig_sm[j] == old_hs[p] or orig_sm[j] == -1:
+                    new_sm[j] = new_hs[p]
+                else:
+                    new_sm[j] = orig_sm[j]
+            else:
+                new_sm[j] = -1
         elif orig_sm[j] == old_hs[p] or orig_sm[j] == -1:
             new_sm[j] = new_hs[p]
         # else: non-contiguous stride; physical layout is invariant — leave unchanged.

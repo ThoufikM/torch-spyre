@@ -1366,11 +1366,17 @@ def _allocate_full_buffer(
         # None falls back to size-based inference inside _resize_device_layout.
         stick_hd = _stick_host_dim(tiled_op, orig_layout.device_layout)
         try:
+            tiled_host_dims = {
+                d
+                for dims in tiled_op.loop_info.loop_tiled_dims
+                for d in dims
+            }
             device_layout = _resize_device_layout(
                 orig_layout.device_layout,
                 tile_size_ints,
                 full_size_ints,
                 stick_host_dim=stick_hd,
+                preserve_unit_host_dims=tiled_host_dims,
             )
         except RuntimeError:
             # Non-standard device layout (e.g. post-restickify HBM strides that
@@ -2244,8 +2250,16 @@ def _divide_ranges(
     # _resize_device_layout does not have to infer it by size (ambiguous for
     # transposed same-size dims — issue #3116). Tiling-invariant, so safe here.
     stick_hd = _stick_host_dim(op, layout.device_layout)
+    unit_dims = {i for i, s in enumerate(new_size_ints) if s == 1}
+    preserve_unit_host_dims = {
+        i for i in tiled_dims if i in unit_dims and len(unit_dims) > 1
+    }
     layout.device_layout = _resize_device_layout(
-        layout.device_layout, old_host_size, new_size_ints, stick_host_dim=stick_hd
+        layout.device_layout,
+        old_host_size,
+        new_size_ints,
+        stick_host_dim=stick_hd,
+        preserve_unit_host_dims=preserve_unit_host_dims,
     )
     return retiled_info
 
