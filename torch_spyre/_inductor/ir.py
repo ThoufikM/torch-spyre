@@ -168,6 +168,16 @@ def _resize_device_layout(
     #3116) without relying on the ambiguous size-elimination + contiguous-stride
     tiebreak.  When ``None`` (all current callers), behaviour is unchanged.
 
+    ``preserve_unit_host_dims`` (optional): host dims that became or may become
+    size 1 because of coarse tiling.  A size-1 device dim may match one of these
+    host dims only when it still carries a real stride (``orig_sm[j] != -1``)
+    and that stride matches the old or new contiguous host stride.  This keeps
+    true singleton placeholders (``stride_map == -1``) from growing, while
+    preserving the non-stick tiled slot needed to reconstruct a full output
+    layout.  If the stick tile-count slot and the real non-stick slot collide
+    after tiling (both size 1 with the same stride), the later device dim is
+    selected, matching the layout order produced by ``SpyreTensorLayout``.
+
     Multi-pass algorithm:
 
     * **Pass 1**: match non-inner-stick device dims to host dims by size.
@@ -240,9 +250,22 @@ def _resize_device_layout(
                 and (orig_sm[j] == old_hs[p] or orig_sm[j] == new_hs[p])
             ]
             if len(preserved_cands) == 1:
-                matched_host[j] = preserved_cands[0]
+                p = preserved_cands[0]
+                later_preserved_match = any(
+                    orig_ds[k] == 1
+                    and orig_sm[k] != -1
+                    and (orig_sm[k] == old_hs[p] or orig_sm[k] == new_hs[p])
+                    for k in range(j + 1, ndev - 1)
+                )
+                if not later_preserved_match:
+                    matched_host[j] = p
             elif len(size1_cands) == 1:
-                matched_host[j] = size1_cands[0]
+                p = size1_cands[0]
+                if (
+                    p not in preserve_unit_host_dims
+                    or new_host_size[p] == old_host_size[p]
+                ):
+                    matched_host[j] = p
             # else: sparse placeholder with no host counterpart — skip silently.
         else:
             size_cands = [p for p in range(ndim) if old_host_size[p] == dsz]

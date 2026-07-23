@@ -893,8 +893,6 @@ class TestDivideRanges(unittest.TestCase):
     def test_divide_ranges_stride_collision(self):
         """Tiling an outer dim when stride_map has two entries with the same
         value (device_size tiebreak case) produces the correct device_layout."""
-        from torch._inductor.ir import FlexibleLayout
-
         from torch_spyre._C import SpyreTensorLayout
 
         # [2, 2, 2, 16] contiguous, stick on dim3 (last).  host_stride[0]=64
@@ -905,12 +903,7 @@ class TestDivideRanges(unittest.TestCase):
         # Tile dim0: [2,2,2,16] -> [1,2,2,16].
         _divide_ranges(op, Integer(2), tiled_dims=[0])
 
-        expected_strides = [
-            int(s) for s in FlexibleLayout.contiguous_strides([1, 2, 2, 16])
-        ]
-        expected = SpyreTensorLayout(
-            [1, 2, 2, 16], expected_strides, torch.float16, [0, 1, 2, 3]
-        )
+        expected = SpyreTensorLayout([2, 2, 1, 1, 64], [32, 16, 64, 64, 1], _FP16)
         self.assertEqual(layout.device_layout, expected)
 
     def test_divide_ranges_tile_count_size_collision(self):
@@ -920,7 +913,6 @@ class TestDivideRanges(unittest.TestCase):
         [2, 128] with stick on dim1: tile-count device_size = ceil(128/64) = 2,
         which equals old_host_size[0] = 2.  Without the stride check, Pass 1
         misclassifies the tile-count dim as non-stick and never updates it."""
-        from torch._inductor.ir import FlexibleLayout
 
         from torch_spyre._C import SpyreTensorLayout
 
@@ -929,8 +921,7 @@ class TestDivideRanges(unittest.TestCase):
         # Tile dim0: [2, 128] -> [1, 128].
         _divide_ranges(op, Integer(2), tiled_dims=[0])
 
-        expected_strides = [int(s) for s in FlexibleLayout.contiguous_strides([1, 128])]
-        expected = SpyreTensorLayout([1, 128], expected_strides, torch.float16, [0, 1])
+        expected = SpyreTensorLayout([2, 1, 64], [64, 128, 1], _FP16)
         self.assertEqual(layout.device_layout, expected)
 
     def test_resize_device_layout_grow_from_singleton(self):
@@ -949,6 +940,61 @@ class TestDivideRanges(unittest.TestCase):
 
         expected = SpyreTensorLayout([4, 128], [128, 1], torch.float16, [0, 1])
         self.assertEqual(result, expected)
+
+    def test_resize_device_layout_preserved_singleton_with_existing_unit_dim(self):
+        """A tiled dim that collapses next to an existing singleton keeps identity.
+
+        [1,20,16,64] tiled on dim1 by 20 shrinks to [1,1,16,64].
+        The preserved stride lets grow-back choose dim1, not the pre-existing
+        host dim0 singleton.
+        """
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.coarse_tile import _resize_device_layout
+
+        full = SpyreTensorLayout([1, 20, 16, 64], torch.float16)
+        tile = _resize_device_layout(
+            full,
+            [1, 20, 16, 64],
+            [1, 1, 16, 64],
+            preserve_unit_host_dims={1},
+        )
+        self.assertEqual(list(tile.device_size), [1, 16, 1, 1, 64])
+        self.assertEqual(list(tile.stride_map), [1024, 64, -1, -1, 1])
+
+        grown = _resize_device_layout(
+            tile,
+            [1, 1, 16, 64],
+            [1, 20, 16, 64],
+            preserve_unit_host_dims={1},
+        )
+        self.assertEqual(list(grown.device_size), [20, 16, 1, 1, 64])
+        self.assertEqual(list(grown.stride_map), [1024, 64, -1, -1, 1])
+
+    def test_resize_device_layout_preserved_singleton_without_existing_unit_dim(self):
+        """A tiled dim can grow back even without a pre-existing host singleton.
+
+        [20,16,64] tiled on dim0 by 20 shrinks to [1,16,64].  The stick
+        tile-count slot also has device_size 1, so grow-back must pick the
+        later non-stick slot carrying the preserved dim0 stride.
+        """
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.coarse_tile import _resize_device_layout
+
+        full = SpyreTensorLayout([20, 16, 64], torch.float16)
+        tile = _resize_device_layout(
+            full,
+            [20, 16, 64],
+            [1, 16, 64],
+            preserve_unit_host_dims={0},
+        )
+        grown = _resize_device_layout(
+            tile,
+            [1, 16, 64],
+            [20, 16, 64],
+            preserve_unit_host_dims={0},
+        )
+
+        self.assertEqual(grown, full)
 
     def test_resize_device_layout_raises_on_unsupported(self):
         """_resize_device_layout raises RuntimeError when the stick host dim
