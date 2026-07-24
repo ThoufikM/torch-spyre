@@ -949,14 +949,21 @@ class TestDivideRanges(unittest.TestCase):
         host dim0 singleton.
         """
         from torch_spyre._C import SpyreTensorLayout
-        from torch_spyre._inductor.coarse_tile import _resize_device_layout
+        from torch_spyre._inductor.coarse_tile import (
+            _preserved_unit_device_dims,
+            _resize_device_layout,
+        )
 
         full = SpyreTensorLayout([1, 20, 16, 64], torch.float16)
+        mapping = _preserved_unit_device_dims(
+            full, [1, 20, 16, 64], [1, 1, 16, 64], {1}
+        )
         tile = _resize_device_layout(
             full,
             [1, 20, 16, 64],
             [1, 1, 16, 64],
             preserve_unit_host_dims={1},
+            preserve_unit_device_dims=mapping,
         )
         self.assertEqual(list(tile.device_size), [1, 16, 1, 1, 64])
         self.assertEqual(list(tile.stride_map), [1024, 64, -1, -1, 1])
@@ -966,6 +973,7 @@ class TestDivideRanges(unittest.TestCase):
             [1, 1, 16, 64],
             [1, 20, 16, 64],
             preserve_unit_host_dims={1},
+            preserve_unit_device_dims=mapping,
         )
         self.assertEqual(list(grown.device_size), [20, 16, 1, 1, 64])
         self.assertEqual(list(grown.stride_map), [1024, 64, -1, -1, 1])
@@ -978,20 +986,61 @@ class TestDivideRanges(unittest.TestCase):
         later non-stick slot carrying the preserved dim0 stride.
         """
         from torch_spyre._C import SpyreTensorLayout
-        from torch_spyre._inductor.coarse_tile import _resize_device_layout
+        from torch_spyre._inductor.coarse_tile import (
+            _preserved_unit_device_dims,
+            _resize_device_layout,
+        )
 
         full = SpyreTensorLayout([20, 16, 64], torch.float16)
+        mapping = _preserved_unit_device_dims(full, [20, 16, 64], [1, 16, 64], {0})
         tile = _resize_device_layout(
             full,
             [20, 16, 64],
             [1, 16, 64],
             preserve_unit_host_dims={0},
+            preserve_unit_device_dims=mapping,
         )
         grown = _resize_device_layout(
             tile,
             [1, 16, 64],
             [20, 16, 64],
             preserve_unit_host_dims={0},
+            preserve_unit_device_dims=mapping,
+        )
+
+        self.assertEqual(grown, full)
+
+    def test_resize_device_layout_preserved_singleton_adjacent_to_stick(self):
+        """Preserved matching must not choose the stick tile-count slot.
+
+        [8,20,16,64] tiled on dim2 by 16 shrinks to [8,20,1,64].
+        Dim2's non-stick slot and the stick tile-count slot both become
+        size 1 with stride 64, so grow-back must use the captured device-dim
+        identity rather than a position-based tie-break.
+        """
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.coarse_tile import (
+            _preserved_unit_device_dims,
+            _resize_device_layout,
+        )
+
+        full = SpyreTensorLayout([8, 20, 16, 64], torch.float16)
+        mapping = _preserved_unit_device_dims(
+            full, [8, 20, 16, 64], [8, 20, 1, 64], {2}
+        )
+        tile = _resize_device_layout(
+            full,
+            [8, 20, 16, 64],
+            [8, 20, 1, 64],
+            preserve_unit_host_dims={2},
+            preserve_unit_device_dims=mapping,
+        )
+        grown = _resize_device_layout(
+            tile,
+            [8, 20, 1, 64],
+            [8, 20, 16, 64],
+            preserve_unit_host_dims={2},
+            preserve_unit_device_dims=mapping,
         )
 
         self.assertEqual(grown, full)

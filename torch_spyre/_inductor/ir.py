@@ -113,6 +113,7 @@ def _resize_device_layout(
     new_host_size: list[int],
     stick_host_dim: int | None = None,
     preserve_unit_host_dims: set[int] | None = None,
+    preserve_unit_device_dims: dict[int, int] | None = None,
 ):
     """Derive a new SpyreTensorLayout for a resized host buffer.
 
@@ -174,9 +175,14 @@ def _resize_device_layout(
     and that stride matches the old or new contiguous host stride.  This keeps
     true singleton placeholders (``stride_map == -1``) from growing, while
     preserving the non-stick tiled slot needed to reconstruct a full output
-    layout.  If the stick tile-count slot and the real non-stick slot collide
-    after tiling (both size 1 with the same stride), the later device dim is
-    selected, matching the layout order produced by ``SpyreTensorLayout``.
+    layout.
+
+    ``preserve_unit_device_dims`` (optional): explicit host-dim -> device-dim
+    identity for preserved tiled dims, captured before shrink while the tiled
+    non-stick device dim is still distinguishable by size/stride.  Grow uses
+    this to reject the stick tile-count slot when it has the same size and
+    stride as the real tiled slot (for example tiling the dim immediately before
+    a one-stick innermost dimension).
 
     Multi-pass algorithm:
 
@@ -209,6 +215,7 @@ def _resize_device_layout(
     ndev = len(orig_sm)
     ndim = len(old_host_size)
     preserve_unit_host_dims = preserve_unit_host_dims or set()
+    preserve_unit_device_dims = preserve_unit_device_dims or {}
 
     # Trust a caller-provided stick_host_dim only when it is consistent with the
     # device tile-count structure: the stick host dim must have a corresponding
@@ -248,17 +255,10 @@ def _resize_device_layout(
                 and new_host_size[p] != old_host_size[p]
                 and orig_sm[j] != -1
                 and (orig_sm[j] == old_hs[p] or orig_sm[j] == new_hs[p])
+                and preserve_unit_device_dims.get(p, j) == j
             ]
             if len(preserved_cands) == 1:
-                p = preserved_cands[0]
-                later_preserved_match = any(
-                    orig_ds[k] == 1
-                    and orig_sm[k] != -1
-                    and (orig_sm[k] == old_hs[p] or orig_sm[k] == new_hs[p])
-                    for k in range(j + 1, ndev - 1)
-                )
-                if not later_preserved_match:
-                    matched_host[j] = p
+                matched_host[j] = preserved_cands[0]
             elif len(size1_cands) == 1:
                 p = size1_cands[0]
                 if (

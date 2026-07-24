@@ -1399,12 +1399,16 @@ def _allocate_full_buffer(
             tiled_host_dims = {
                 d for dims in tiled_op.loop_info.loop_tiled_dims for d in dims
             }
+            preserved_device_dims = getattr(
+                orig_layout, "_coarse_tile_preserve_unit_device_dims", {}
+            )
             device_layout = _resize_device_layout(
                 orig_layout.device_layout,
                 tile_size_ints,
                 full_size_ints,
                 stick_host_dim=stick_hd,
                 preserve_unit_host_dims=tiled_host_dims,
+                preserve_unit_device_dims=preserved_device_dims,
             )
         except RuntimeError:
             # Non-standard device layout (e.g. post-restickify HBM strides that
@@ -2279,17 +2283,52 @@ def _divide_ranges(
     # transposed same-size dims — issue #3116). Tiling-invariant, so safe here.
     stick_hd = _stick_host_dim(op, layout.device_layout)
     # Preserve all tiled host dims here; _resize_device_layout only applies
-    # the hint to dims that actually collapse to size 1.  _allocate_full_buffer
-    # passes the same identity when growing the full layout back.
+    # the hint to dims that actually collapse to size 1.  Capture the matching
+    # non-stick device dim before shrink so grow can reject stick tile-count
+    # slots with the same size and stride.
     preserve_unit_host_dims = set(tiled_dims)
+    preserved_device_dims = _preserved_unit_device_dims(
+        layout.device_layout, old_host_size, new_size_ints, preserve_unit_host_dims
+    )
     layout.device_layout = _resize_device_layout(
         layout.device_layout,
         old_host_size,
         new_size_ints,
         stick_host_dim=stick_hd,
         preserve_unit_host_dims=preserve_unit_host_dims,
+        preserve_unit_device_dims=preserved_device_dims,
     )
+    layout._coarse_tile_preserve_unit_device_dims = preserved_device_dims
     return retiled_info
+
+
+def _preserved_unit_device_dims(
+    orig_stl,
+    old_host_size: list[int],
+    new_host_size: list[int],
+    preserve_unit_host_dims: set[int],
+) -> dict[int, int]:
+    """Map preserved tiled host dims to their non-stick device dim before shrink."""
+    from torch._inductor.ir import FlexibleLayout
+
+    old_hs = [int(s) for s in FlexibleLayout.contiguous_strides(old_host_size)]
+    orig_ds = list(orig_stl.device_size)
+    orig_sm = list(orig_stl.stride_map)
+    ndev = len(orig_ds)
+    result: dict[int, int] = {}
+    for p in preserve_unit_host_dims:
+        if not (0 <= p < len(old_host_size)):
+            continue
+        if old_host_size[p] == new_host_size[p]:
+            continue
+        candidates = [
+            j
+            for j in range(ndev - 1)
+            if orig_ds[j] == old_host_size[p] and orig_sm[j] == old_hs[p]
+        ]
+        if len(candidates) == 1:
+            result[p] = candidates[0]
+    return result
 
 
 def _loop_var_to_reduction_ranges_pos(
