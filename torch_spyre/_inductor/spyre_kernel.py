@@ -610,6 +610,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # which throws on symbolic dimensions.  They are only needed when this
         # op is inside a tiling loop, so skip the computation for non-tiled ops.
         tiled_syms: list[list] = []
+        unit_tiled_host_dims: list[list[int]] = []
         if n_levels > 0:
             # Build host-range-index → iteration-space-key-index map by walking
             # data.ranges and counting only non-unit entries.  loop_tiled_dims
@@ -638,22 +639,42 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
 
             tiled_syms_per_level_outermost: list[list] = []
+            unit_tiled_host_dims_outermost: list[list[int]] = []
             for lvl in range(n_levels):
+                level_unit_host_dims: list[int] = []
                 level_syms: list = []
                 if lvl < len(raw_tiled_dims):
                     for d in raw_tiled_dims[lvl]:
                         mapped = host_to_it.get(d)
                         if mapped is not None and mapped < len(it_space_keys):
                             level_syms.append(it_space_keys[mapped])
+                        elif (
+                            li is not None
+                            and lvl < len(li.loop_count)
+                            and hasattr(ir_node, "data")
+                            and hasattr(ir_node.data, "ranges")
+                            and d < len(ir_node.data.ranges)
+                        ):
+                            # Coarse tiling can divide a tiled host dim down to
+                            # 1. Inductor then omits it from the compact
+                            # iteration space, so remember the host dim and
+                            # repair tiled_symbols after tensor alignment creates
+                            # (or can accept) a unit z* coordinate for it.
+                            try:
+                                if int(ir_node.data.ranges[d]) == 1:
+                                    level_unit_host_dims.append(d)
+                            except (TypeError, ValueError):
+                                pass
                 if lvl < len(raw_tiled_red_dims):
                     for r in raw_tiled_red_dims[lvl]:
                         sym_idx = n_output_it_syms + r
                         if sym_idx < len(it_space_keys):
                             level_syms.append(it_space_keys[sym_idx])
                 tiled_syms_per_level_outermost.append(level_syms)
+                unit_tiled_host_dims_outermost.append(level_unit_host_dims)
             # Reverse so index 0 = innermost level.
             tiled_syms = list(reversed(tiled_syms_per_level_outermost))
-
+            unit_tiled_host_dims = list(reversed(unit_tiled_host_dims_outermost))
         # Collect (max, granularity) bounds for any symbolic iteration-space
         # dims. These are passed through OpSpec so SDSC codegen can emit
         # symbolicDimInfo_ without needing the live ShapeEnv (which is gone
@@ -694,6 +715,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             op_info,
             tiled_symbols=tiled_syms,
             symbolic_dim_bounds=symbolic_dim_bounds,
+            unit_tiled_host_dims=unit_tiled_host_dims,
             debug_handle=debug_handle,
         )
 
@@ -1088,6 +1110,15 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                         )
                         + "],"
                     )
+                if op_spec.unit_tiled_host_dims:
+                    buf.writeline(
+                        "unit_tiled_host_dims=["
+                        + ", ".join(
+                            "[" + ", ".join(str(d) for d in level) + "]"
+                            for level in op_spec.unit_tiled_host_dims
+                        )
+                        + "],"
+                    )
                 buf.writeline(
                     f"symbolic_dim_bounds={_serialize_value(op_spec.symbolic_dim_bounds)},"
                 )
@@ -1123,6 +1154,74 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
             buf.writeline("),")
 
 
+def _repair_unit_tiled_symbols(op_spec, old_it_space, new_op_space_splits, new_tensors):
+    """Attach synthetic z* symbols for coarse-tiled host dims that became size 1."""
+    unit_host_dims = getattr(op_spec, "unit_tiled_host_dims", [])
+    if not unit_host_dims or not op_spec.tiled_symbols or not new_tensors:
+        return
+
+    old_syms = set(old_it_space.keys())
+    synthetic_syms = {
+        sym
+        for sym in new_op_space_splits
+        if sym not in old_syms and str(sym).startswith("z")
+    }
+
+    def fresh_synthetic_sym() -> sympy.Symbol:
+        used = set(new_op_space_splits) | old_syms
+        idx = 0
+        while True:
+            sym = sympy.Symbol(f"z{idx}")
+            if sym not in used:
+                new_op_space_splits[sym] = (sympy.Integer(1), 1)
+                synthetic_syms.add(sym)
+                return sym
+            idx += 1
+
+    output_tensor = new_tensors[-1]
+    output_coords = output_tensor["coordinates"]
+
+    used: set[sympy.Symbol] = set()
+    for level_syms, host_dims in zip(op_spec.tiled_symbols, unit_host_dims):
+        if level_syms:
+            continue
+
+        for host_dim in host_dims:
+            if host_dim >= len(output_coords):
+                continue
+
+            # Prefer a synthetic coordinate already introduced by align_tensors.
+            # That symbol is the aligned representation of the physical unit dim
+            # that the outer coarse-tile loop advances.
+            coord = sympy.sympify(output_coords[host_dim])
+            candidates = sorted(coord.free_symbols & synthetic_syms, key=str)
+            for sym in candidates:
+                if sym not in used:
+                    level_syms.append(sym)
+                    used.add(sym)
+                    break
+
+            if level_syms:
+                break
+
+            # If the aligned output coordinate is still constant, create a unit
+            # z* symbol and install it on matching unit tensor dims so the tile
+            # level has an affine symbol to bind to.
+            sym = fresh_synthetic_sym()
+            for tensor in new_tensors:
+                if host_dim >= len(tensor["coordinates"]):
+                    continue
+                if sympy.sympify(tensor["size"][host_dim]) != 1:
+                    continue
+                tensor_coord = sympy.sympify(tensor["coordinates"][host_dim])
+                if tensor_coord.free_symbols:
+                    continue
+                tensor["coordinates"][host_dim] = sym
+            level_syms.append(sym)
+            used.add(sym)
+            break
+
+
 def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
     # Both parameters must be provided together for gather kernels — indirect_sizes
     # decomposes symbols in align_tensors; indirect_access_subs replaces them with IndirectAccess.
@@ -1137,6 +1236,8 @@ def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
         indirect_sizes,
     )
     op_spec.iteration_space = new_op_space_splits
+
+    _repair_unit_tiled_symbols(op_spec, it_space, new_op_space_splits, new_tensors)
 
     for arg, t in zip(op_spec.args, new_tensors):
         arg.device_size = t["size"]
