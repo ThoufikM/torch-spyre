@@ -3068,7 +3068,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         op = _reduction_op(
             (1, 64, 64), reduction_ranges=(64,), reduction_type=BATCH_MATMUL_OP
         )
-        candidate = SimpleNamespace(
+        candidate = soha.SpanOverflowCandidate(
             chunking_info=ChunkingInfo(
                 total_bytes=1,
                 per_core_span=2 * MAX_SPAN_BYTES,
@@ -3441,8 +3441,12 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             stick_elems=64,
             reason="input span overflow for arg0",
         )
-        output_candidate = SimpleNamespace(chunking_info=output_info, source="output")
-        input_candidate = SimpleNamespace(chunking_info=input_info, source="input:arg0")
+        output_candidate = soha.SpanOverflowCandidate(
+            chunking_info=output_info, source="output"
+        )
+        input_candidate = soha.SpanOverflowCandidate(
+            chunking_info=input_info, source="input:arg0"
+        )
 
         def remaining_after_tile(_op, _max_cores, split_by_host_dim):
             if set(split_by_host_dim) == {0, 1}:
@@ -3496,8 +3500,8 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             reason="output span overflow",
         )
         candidates = [
-            SimpleNamespace(chunking_info=dim0_info, source="output"),
-            SimpleNamespace(chunking_info=dim1_info, source="output"),
+            soha.SpanOverflowCandidate(chunking_info=dim0_info, source="output"),
+            soha.SpanOverflowCandidate(chunking_info=dim1_info, source="output"),
         ]
 
         def remaining_after_tile(_op, _max_cores, split_by_host_dim):
@@ -4390,18 +4394,31 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
             plan = plan_span_overflow_tile(op, max_cores=1)
 
         self.assertIs(plan, output_only_plan)
-        self.assertEqual(
-            search.call_args_list,
-            [
-                call(op, 1, all_candidates),
-                call(
-                    op,
-                    1,
-                    output_candidates,
-                    ignore_reduction_spans=True,
-                ),
-            ],
+        self.assertEqual(search.call_count, 2)
+        first_args, first_kwargs = search.call_args_list[0]
+        second_args, second_kwargs = search.call_args_list[1]
+        self.assertIs(first_args[0], op)
+        self.assertEqual(first_args[1], 1)
+        self.assertTrue(
+            all(
+                actual is expected
+                for actual, expected in zip(
+                    first_args[2], all_candidates, strict=True
+                )
+            )
         )
+        self.assertEqual(first_kwargs, {})
+        self.assertIs(second_args[0], op)
+        self.assertEqual(second_args[1], 1)
+        self.assertTrue(
+            all(
+                actual is expected
+                for actual, expected in zip(
+                    second_args[2], output_candidates, strict=True
+                )
+            )
+        )
+        self.assertEqual(second_kwargs, {"ignore_reduction_spans": True})
 
     def test_missing_output_write_dep_skips_auto_tiling(self):
         op = _pointwise_op((1, 8195, 256, 64))
