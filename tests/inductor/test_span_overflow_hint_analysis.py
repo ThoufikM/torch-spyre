@@ -4402,9 +4402,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
         self.assertTrue(
             all(
                 actual is expected
-                for actual, expected in zip(
-                    first_args[2], all_candidates, strict=True
-                )
+                for actual, expected in zip(first_args[2], all_candidates, strict=True)
             )
         )
         self.assertEqual(first_kwargs, {})
