@@ -350,6 +350,7 @@ def _rescale_stl_for_dtype(
     stl: SpyreTensorLayout,
     out_dtype: torch.dtype,
     ea: ElementArrangement,
+    logical_stick_size: int,
 ) -> SpyreTensorLayout:
     """Propagate a device layout across a same-shape, differing-stick-depth dtype conversion.
 
@@ -381,7 +382,14 @@ def _rescale_stl_for_dtype(
     # left as-is.
     for i, s in enumerate(stl.stride_map):
         if s == in_eps:
-            out_device_size[i] = stl.device_size[i] * in_eps // out_eps
+            if logical_stick_size % in_eps != 0 or logical_stick_size % out_eps != 0:
+                # For an unaligned logical dimension, derive the number of
+                # output sticks from logical elements. Using padded physical
+                # capacity can produce zero or treat padding as real data.
+                out_device_size[i] = (logical_stick_size + out_eps - 1) // out_eps
+            else:
+                # Preserve physical layout rescaling for aligned dimensions.
+                out_device_size[i] = stl.device_size[i] * in_eps // out_eps
             out_stride_map[i] = out_eps
             break
     return SpyreTensorLayout(
@@ -585,7 +593,14 @@ def _single_arg_op_layout(
             #    Rebuild a clean dense layout from the output host size instead,
             #    as the general (non-EA) convert path does.
             if fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS:
-                return [_rescale_stl_for_dtype(stl, output.dtype, fmt)]
+                return [
+                    _rescale_stl_for_dtype(
+                        stl,
+                        output.dtype,
+                        fmt,
+                        concretize_expr(output.size[-1]),
+                    )
+                ]
 
             # Dense reconstruction from the output host size. When the input
             # stick dim is unaligned, force a full input-stick depth so stick
@@ -607,7 +622,12 @@ def _single_arg_op_layout(
             # Propagate the input device layout and rescale for the dtype change,
             # preserving any padding present in the input STL.
             return [
-                _rescale_stl_for_dtype(stl, output.dtype, ElementArrangement.QFP8CH)
+                _rescale_stl_for_dtype(
+                    stl,
+                    output.dtype,
+                    ElementArrangement.QFP8CH,
+                    concretize_expr(output.size[-1]),
+                )
             ]
 
         case spyreop.qfp8wt.default:
