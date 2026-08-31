@@ -346,6 +346,15 @@ def _rescale_stl_for_dtype(
     for i, s in enumerate(stl.stride_map):
         if s == in_eps:
             out_device_size[i] = stl.device_size[i] * in_eps // out_eps
+            if out_device_size[i] <= 0:
+                raise Unsupported(
+                    "Spyre dtype conversion does not support an unaligned layout "
+                    f"that produces a non-positive stick count: "
+                    f"output_sticks={out_device_size[i]}, "
+                    f"input_sticks={stl.device_size[i]}, "
+                    f"input_stick_size={in_eps}, "
+                    f"output_stick_size={out_eps}"
+                )
             out_stride_map[i] = out_eps
             break
     return SpyreTensorLayout(
