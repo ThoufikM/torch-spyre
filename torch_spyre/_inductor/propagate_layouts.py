@@ -346,15 +346,6 @@ def _rescale_stl_for_dtype(
     for i, s in enumerate(stl.stride_map):
         if s == in_eps:
             out_device_size[i] = stl.device_size[i] * in_eps // out_eps
-            if out_device_size[i] <= 0:
-                raise Unsupported(
-                    "Spyre dtype conversion does not support an unaligned layout "
-                    f"that produces a non-positive stick count: "
-                    f"output_sticks={out_device_size[i]}, "
-                    f"input_sticks={stl.device_size[i]}, "
-                    f"input_stick_size={in_eps}, "
-                    f"output_stick_size={out_eps}"
-                )
             out_stride_map[i] = out_eps
             break
     return SpyreTensorLayout(
@@ -561,7 +552,19 @@ def _single_arg_op_layout(
             #    Rebuild a clean dense layout from the output host size instead,
             #    as the general (non-EA) convert path does.
             if fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS:
-                return [_rescale_stl_for_dtype(stl, output.dtype, fmt)]
+                output_layout = _rescale_stl_for_dtype(stl, output.dtype, fmt)
+
+                if any(size <= 0 for size in output_layout.device_size):
+                    raise Unsupported(
+                        "Spyre staggered dtype conversion does not support an "
+                        "unaligned layout that produces a non-positive device "
+                        f"dimension: output_device_size={output_layout.device_size}, "
+                        f"input_device_size={stl.device_size}, "
+                        f"input_stick_size={stl.device_size[-1]}, "
+                        f"output_stick_size={get_elem_in_stick(output.dtype)}"
+                    )
+
+                return [output_layout]
 
             # Dense reconstruction from the output host size. When the input
             # stick dim is unaligned, force a full input-stick depth so stick
