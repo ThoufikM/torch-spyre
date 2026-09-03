@@ -493,6 +493,11 @@ class Term:
     mod: sympy.Expr | None  # modulo
     dim_size: sympy.Expr
     offset: sympy.Expr = sympy.S.Zero  # offset
+    # Constant remainder that a num>1 (skip/interleave) term's num could not
+    # absorb from the coordinate's offset, e.g. the "+1" in 2*i + 1. Carried
+    # through to the gap dimension align_tensors_pure creates for num>1
+    # terms, so interleaved lanes (even/odd, ...) keep distinct coordinates.
+    gap_offset: sympy.Expr = sympy.S.Zero
 
 
 def normalize_coordinates(
@@ -626,6 +631,14 @@ def normalize_coordinates(
         for dim_term in dim_terms[::-1]:
             dim_term.offset = offset // dim_term.num
             offset %= dim_term.num
+
+        # The remainder that no term's num could absorb (e.g. the "+1" of
+        # 2*i + 1, when num=2 does not divide it) is the constant lane
+        # inside the interleave/gap dimension that align_tensors_pure later
+        # materializes for a num>1 term. Losing it collapses even/odd (or
+        # any stride-N) slices onto the same physical gap coordinate.
+        if dim_terms:
+            dim_terms[0].gap_offset = offset
 
         # split dims with n>1 terms
         split_dim_terms = []
@@ -857,7 +870,9 @@ def align_tensors_pure(
     splits: dict[sympy.Symbol, sympy.Expr] = {var: set() for var in all_vars}
 
     for i, terms in enumerate(all_terms):
-        for num, den, var, mod, dim_size, offset in [astuple(term) for term in terms]:
+        for num, den, var, mod, dim_size, offset, gap_offset in [
+            astuple(term) for term in terms
+        ]:
             if var is not None:
                 if den != stick_size[i] or var != stick_dim[i]:
                     # add den to splits unless stick dim and stick size
@@ -942,7 +957,7 @@ def align_tensors_pure(
     for j, terms in enumerate(all_terms):
         size = []
         coordinates = []
-        for num, den, var, mod, dim_size, offset in [
+        for num, den, var, mod, dim_size, offset, gap_offset in [
             astuple(term) for term in terms[:-1]
         ]:
             # for each term except last one (stick dim)
@@ -979,11 +994,17 @@ def align_tensors_pure(
                 (offset, term) = coordinates[-1].as_coeff_Add()
                 coordinates[-1] = term // den + offset
             if num > 1:
-                # iteration skips over elements in dim, realize gap as new dimension
+                # iteration skips over elements in dim, realize gap as new dimension.
+                # The dim just appended above covers all num interleaved lanes
+                # (dim_size elements), so it must shrink by num once the lanes
+                # get their own dimension -- otherwise the two dims together
+                # address num times too many elements, and every lane's
+                # coordinate silently aliases lane 0 (see gap_offset on Term).
+                size[-1] //= num
                 size.append(num)
-                coordinates.append(sympy.S.Zero)
+                coordinates.append(gap_offset)
         # add stick dim
-        num, den, var, mod, dim_size, offset = astuple(terms[-1])
+        num, den, var, mod, dim_size, offset, gap_offset = astuple(terms[-1])
         size.append(dim_size)
         coordinates.append(
             (var % dim_size if var is not None else sympy.S.Zero) + offset

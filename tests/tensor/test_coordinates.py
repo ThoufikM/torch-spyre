@@ -803,5 +803,77 @@ class TestNormalizeCoordinatesFusion(TestCase):
         self.assertEqual([int(t.dim_size) for t in terms], [32, 64])
 
 
+class TestInterleavedGapCoordinates(TestCase):
+    """A num>1 (skip/interleave) term must keep its two lanes distinct.
+
+    ``align_tensors_pure`` realizes a coordinate like ``2*i`` or ``2*i + 1``
+    as a split ``[i, gap]`` pair: an outer dim walked by ``i`` and an inner
+    "gap" dim selecting which interleaved lane. Before this fix, the "+1" in
+    ``2*i + 1`` was computed and then dropped during normalization, so both
+    lanes' gap dim got coordinate 0 -- ``even`` and ``odd`` slices of the
+    same tensor silently addressed the same physical elements. See the
+    fused ``transpose + RoPE`` case on Spyre, where a transposed view
+    consumed directly by RoPE's interleaved read produced exactly this
+    aliasing and corrupted results (max_diff in the single digits on an
+    fp16 tensor whose values are O(1)).
+    """
+
+    def test_normalize_coordinates_preserves_interleave_gap_offset(self):
+        """``2*i`` and ``2*i + 1`` must normalize to distinct gap_offsets."""
+        i = sympy.Symbol("i")
+
+        even_terms = normalize_coordinates(
+            {i: 4}, [8], [2 * i], lambda: sympy.Symbol("z0")
+        )
+        odd_terms = normalize_coordinates(
+            {i: 4}, [8], [2 * i + 1], lambda: sympy.Symbol("z0")
+        )
+
+        self.assertEqual(even_terms[0].num, 2)
+        self.assertEqual(even_terms[0].gap_offset, 0)
+        self.assertEqual(odd_terms[0].num, 2)
+        self.assertEqual(odd_terms[0].gap_offset, 1)
+
+    def test_align_tensors_even_odd_interleave_distinct(self):
+        """``x[0::2]`` and ``x[1::2]`` of an 8-element axis stay distinct.
+
+        x = [0, 1, 2, 3, 4, 5, 6, 7]
+        even = x[0::2] -> 2*i   (elements 0, 2, 4, 6)
+        odd  = x[1::2] -> 2*i+1 (elements 1, 3, 5, 7)
+
+        Both must normalize to an outer dim of size 4 (walked by i) and an
+        inner gap dim of size 2, with even at gap coordinate 0 and odd at
+        gap coordinate 1 -- not both at 0, which would make ``odd`` silently
+        read ``even``'s elements.
+        """
+        i = sympy.Symbol("i")
+        var_ranges = {i: (4, 1)}
+
+        _, even_tensors, _ = align_tensors(
+            dict(var_ranges),
+            [{"size": [8, 64], "coordinates": [2 * i, sympy.S.Zero]}],
+        )
+        _, odd_tensors, _ = align_tensors(
+            dict(var_ranges),
+            [{"size": [8, 64], "coordinates": [2 * i + 1, sympy.S.Zero]}],
+        )
+
+        even_size, even_coords = even_tensors[0]["size"], even_tensors[0]["coordinates"]
+        odd_size, odd_coords = odd_tensors[0]["size"], odd_tensors[0]["coordinates"]
+
+        # The gap dimension (size 2) sits right before the stick dim in both.
+        gap_dim_idx = even_size.index(2)
+        self.assertEqual(even_size, odd_size)
+        self.assertEqual(even_coords[gap_dim_idx], 0)
+        self.assertEqual(odd_coords[gap_dim_idx], 1)
+        self.assertNotEqual(even_coords[gap_dim_idx], odd_coords[gap_dim_idx])
+        # Everything outside the gap dim (the outer i-walk, the stick) is
+        # identical -- only the interleave lane differs.
+        for idx in range(len(even_size)):
+            if idx == gap_dim_idx:
+                continue
+            self.assertEqual(even_coords[idx], odd_coords[idx])
+
+
 if __name__ == "__main__":
     run_tests()

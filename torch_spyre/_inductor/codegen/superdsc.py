@@ -348,7 +348,17 @@ def _get_device_dim_order(
                             dim_order.append(sym)
             continue
         expr = coord.subs(symbol_mapping)
-        if expr == 0 and stick_dim is not None and stick_dim not in dim_order:
+        if (
+            not expr.free_symbols
+            and stick_dim is not None
+            and stick_dim not in dim_order
+        ):
+            # Any constant coordinate marks a placeholder physical dim, not
+            # just a zero one -- e.g. the gap dim views.py's align_tensors_pure
+            # creates for an interleaved (num>1) term carries a nonzero
+            # constant (which lane: 0, 1, ...). Dropping this slot when the
+            # constant happens to be nonzero loses it from dim_order entirely,
+            # so its lane never contributes to addressing.
             dim_order.append(stick_dim)
         for sym in expr.free_symbols:
             # For kernel tensors in conv ops, exclude size-1 output-spatial dimensions.
@@ -1380,6 +1390,26 @@ def _create_sdsc_tensors(
                 if not _is_conv(op_spec.op):
                     backGap[dim] = dev_dim_size - it_dim_size
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
+            elif (
+                dim_coord is not None
+                and not isinstance(dim_coord, IndirectAccess)
+                and not dim_coord.free_symbols
+            ):
+                # A purely constant coordinate with no device/iteration-size
+                # gap (e.g. the lane offset of the gap dimension
+                # align_tensors_pure creates for an interleaved num>1 term,
+                # now reachable via _get_device_dim_order's constant-coordinate
+                # check above) carries no loop variable, so it never gets an
+                # address contribution from the per-iteration
+                # affine terms generated elsewhere. Fold its fixed lane
+                # offset into the base address here -- `sum(offsets.values())`
+                # is how compute_ops.generate_sdsc assembles the base
+                # address, so this is purely additive and independent of the
+                # padding case above; it must not touch backGap/strides,
+                # which are specific to the device/iteration-size gap.
+                dim_offset = int(dim_coord)
+                if dim_offset:
+                    offsets[dim] += dim_offset * dim_device_stride
 
         # Injected dimensions (mb_sym for P=1, stick symbols for absent coords)
         # require explicit max_dim_size: 1 for value/output, -1 for others.
