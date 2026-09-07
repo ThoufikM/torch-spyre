@@ -323,6 +323,14 @@ def compute_coordinates(
                 f"be expressed as a device coordinate"
             )
 
+        # limit is step * range, but the last accessed element is
+        # step * (range - 1). For a strided slice whose final group is partial,
+        # the unused tail must not introduce a coordinate in the next host
+        # dimension (e.g. 3*i, i<43, never reaches the boundary at 128).
+        # Keep the backwards-traversal check above on the original bounds.
+        if concrete_step > 1:
+            concrete_limit -= concrete_step - 1
+
         # find primary dim with largest stride less than or equal to step
         primary_stride = 0
         primary_dim = -1
@@ -495,6 +503,88 @@ class Term:
     offset: sympy.Expr = sympy.S.Zero  # offset
 
 
+def _coalesce_quotient_remainder_dims(
+    size: Sequence[sympy.Expr], coordinates: Sequence[sympy.Expr]
+) -> tuple[list[sympy.Expr], list[sympy.Expr]]:
+    """Remove fractional coordinates when adjacent physical dims cancel them.
+
+    For a non-stick pair with inner size q, q*floor(x/q) + x%q is exactly x.
+    Coalescing the pair preserves every physical address, including carries
+    from a non-unit fraction such as floor(3*i/64). Never coalesce the stick:
+    its boundary is part of the hardware layout, not just a reshape choice.
+    """
+    size, coordinates = list(size), list(coordinates)
+    dim = 0
+    while dim + 1 < len(size) - 1:
+        outer, inner = coordinates[dim : dim + 2]
+        radix = size[dim + 1]
+        if isinstance(outer, FloorDiv):
+            ratio = outer.args[0] / outer.args[1]
+        elif outer.func == sympy.floor:
+            ratio = outer.args[0]
+        else:
+            dim += 1
+            continue
+        merged = sympy.expand(radix * ratio)
+        if len(merged.free_symbols) != 1 or inner != sympy.Mod(merged, radix):
+            dim += 1
+            continue
+        var = next(iter(merged.free_symbols))
+        scale = merged.coeff(var)
+        offset = merged.subs(var, 0)
+        extent = size[dim] * radix
+        if (
+            scale.is_Integer is not True
+            or scale <= 1
+            or offset.is_Integer is not True
+            or offset < 0
+            or sympy.expand(merged - scale * var - offset) != 0
+            or extent % scale != 0
+        ):
+            dim += 1
+            continue
+        size[dim : dim + 2] = [extent]
+        coordinates[dim : dim + 2] = [merged]
+        dim = max(dim - 1, 0)
+    return size, coordinates
+
+
+def _factor_affine_gaps(
+    size: Sequence[sympy.Expr], coordinates: Sequence[sympy.Expr]
+) -> tuple[list[sympy.Expr], list[sympy.Expr]]:
+    """Factor a strided non-stick dimension without changing its storage span.
+
+    A physical dimension of N elements accessed at s*i+b becomes dimensions
+    (N/s, s) accessed at (i+b//s, b%s). The lane dimension is never factored.
+    Non-divisible spans must be padded by the producer before this transform.
+    """
+    new_size: list[sympy.Expr] = []
+    new_coords: list[sympy.Expr] = []
+    for dim, (extent, coord) in enumerate(zip(size, coordinates)):
+        if dim != len(size) - 1 and len(coord.free_symbols) == 1:
+            var = next(iter(coord.free_symbols))
+            scale = coord.coeff(var)
+            offset = coord.subs(var, 0)
+            if (
+                scale.is_Integer is True
+                and scale > 1
+                and offset.is_Integer is True
+                and offset >= 0
+                and sympy.expand(coord - scale * var - offset) == 0
+            ):
+                if extent % scale != 0:
+                    raise Unsupported(
+                        f"strided device dimension of size {extent} must be padded "
+                        f"to a multiple of step {scale} before alignment"
+                    )
+                new_size.extend((extent // scale, scale))
+                new_coords.extend((var + offset // scale, offset % scale))
+                continue
+        new_size.append(extent)
+        new_coords.append(coord)
+    return new_size, new_coords
+
+
 def normalize_coordinates(
     var_ranges: dict[sympy.Symbol, sympy.Expr],
     size: Sequence[sympy.Expr],
@@ -564,6 +654,9 @@ def normalize_coordinates(
             modulus,
             dim_size,
         )
+
+    size, coordinates = _coalesce_quotient_remainder_dims(size, coordinates)
+    size, coordinates = _factor_affine_gaps(size, coordinates)
 
     # terms in non-increasing stride order
     terms = []
