@@ -68,6 +68,9 @@ from .views import (
     build_alignment_inputs,
     compute_coordinates,
     matching_dim,
+    normalize_coordinates,
+    _strided_coordinate_parts,
+    _coalesce_quotient_remainder_dims,
 )
 
 # PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).
@@ -2011,6 +2014,218 @@ def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
     return len(stick_vars) <= 1 and stick_vars.isdisjoint(nonstick_vars)
 
 
+def strided_stick_host_dim(
+    stl: SpyreTensorLayout,
+    host_layout: FixedLayout,
+    dep: MemoryDep,
+    indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
+) -> int | None:
+    """Find a basic strided slice that skips lanes in the physical stick.
+
+    Whole-stick strides with lane zero already have a supported sparse layout.
+    Restrict recognition to one affine loop variable on one logical dimension;
+    general indirect and mixed-radix indexing needs its own lowering.
+    """
+    if stl.element_arrangement != ElementArrangement.STANDARD:
+        return None
+    stick_stride = stl.stride_map[-1]
+    dims = [
+        dim
+        for dim, (size, stride) in enumerate(zip(host_layout.size, host_layout.stride))
+        if concretize_expr(size) > 1 and concretize_expr(stride) == stick_stride
+    ]
+    if len(dims) != 1:
+        return None
+    dim = dims[0]
+    coord = host_coordinates(host_layout, dep, indirect_sizes)[dim]
+    if len(coord.free_symbols) != 1:
+        return None
+    var = next(iter(coord.free_symbols))
+    if var not in dep.ranges:
+        return None
+    step = coord.coeff(var)
+    offset = coord.subs(var, 0)
+    if (
+        step.is_Integer is not True
+        or step <= 1
+        or offset.is_Integer is not True
+        or offset < 0
+        or sympy.expand(coord - step * var - offset) != 0
+    ):
+        return None
+    eps = stl.elems_per_stick()
+    if step % eps == 0 and offset % eps == 0:
+        return None
+    return dim
+
+
+def compute_strided_view_restickify_target(
+    in_stl: SpyreTensorLayout,
+    in_host: FixedLayout,
+    in_dep: MemoryDep,
+    out_stl: SpyreTensorLayout,
+    out_dep: MemoryDep,
+    indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
+) -> SpyreTensorLayout | None:
+    """Move the full producer's stick before consuming a strided view.
+
+    Restickify insertion copies the producer buffer, not its consumer's slice.
+    Derive the copy layout from a full-buffer dependency, then validate it using
+    the original sliced dependency. Using the slice to describe the copy would
+    either reject its unsupported stick expression or copy the wrong elements.
+    """
+    if (
+        in_stl.device_dtype != DataFormats.SEN169_FP16
+        or in_stl.element_arrangement != ElementArrangement.STANDARD
+        or out_stl.element_arrangement != ElementArrangement.STANDARD
+        or in_host.offset != 0
+    ):
+        return None
+    sliced_dim = strided_stick_host_dim(in_stl, in_host, in_dep, indirect_sizes)
+    if sliced_dim is None:
+        return None
+    out_coords = try_device_coordinates(out_stl, out_dep, indirect_sizes)
+    if out_coords is None or not out_coords[-1].free_symbols:
+        return None
+    in_coords = host_coordinates(in_host, in_dep, indirect_sizes)
+    target_dim = matching_dim(in_coords, out_coords[-1])
+    if target_dim is None or target_dim == sliced_dim:
+        return None
+
+    full_vars = tuple(
+        sympy.Dummy(f"restick_full_{i}", integer=True, nonnegative=True)
+        for i in range(len(in_host.size))
+    )
+    full_dep = MemoryDep(
+        in_dep.name, in_host.make_indexer()(full_vars), full_vars, tuple(in_host.size)
+    )
+    full_coords = try_device_coordinates(in_stl, full_dep, None)
+    if full_coords is None:
+        return None
+    full_host_coords = host_coordinates(in_host, full_dep, None)
+    target = compute_restickify_target_layout(
+        in_stl, in_host, full_host_coords[target_dim], full_host_coords, full_coords
+    )
+    if target is None:
+        return None
+    # The gap axis used by alignment must exactly factor the physical span.
+    # Pad the copy's now-nonstick sliced dimension when its size is not a
+    # multiple of the step; the original input allocation remains unchanged.
+    slice_var = next(iter(in_coords[sliced_dim].free_symbols))
+    step = int(in_coords[sliced_dim].coeff(slice_var))
+    target_full_coords = try_device_coordinates(target, full_dep, None)
+    if target_full_coords is None:
+        return None
+    axes = [
+        i
+        for i, coord in enumerate(target_full_coords[:-1])
+        if coord == full_host_coords[sliced_dim]
+    ]
+    if len(axes) != 1:
+        return None
+    device_size = list(target.device_size)
+    axis = axes[0]
+    alignment = math.lcm(step, target.elems_per_stick())
+    device_size[axis] = ((device_size[axis] + alignment - 1) // alignment) * alignment
+    target = SpyreTensorLayout(
+        device_size, list(target.stride_map), target.device_dtype
+    )
+    target_coords = try_device_coordinates(target, in_dep, indirect_sizes)
+    if (
+        target_coords is None
+        or not is_stick_expr_offset_free(target_coords[-1], target.elems_per_stick())
+        or not stick_compatible([target_coords, out_coords])
+    ):
+        return None
+    return target
+
+
+def compute_fractional_view_relayout_target(
+    in_stl: SpyreTensorLayout,
+    in_dep: MemoryDep,
+    out_stl: SpyreTensorLayout,
+    out_dep: MemoryDep,
+    indirect_sizes=None,
+) -> SpyreTensorLayout | None:
+    """Make fractional non-stick digits adjacent by copying the producer.
+
+    Reordering physical dimensions changes storage, so this must be a real
+    layout copy, never a metadata-only permutation of the input allocation.
+    Only request the copy when normalization fails in the source order and
+    succeeds in host-stride order with the same physical stick. Pad the
+    fresh copy when a gap dimension needs complete step groups; never resize
+    the existing input allocation.
+    """
+    if in_stl.element_arrangement != ElementArrangement.STANDARD:
+        return None
+    coords = try_device_coordinates(in_stl, in_dep, indirect_sizes)
+    if coords is None or not (
+        any(_strided_coordinate_parts(coord) is not None for coord in coords[:-1])
+        or any(
+            not node.args[0].is_Symbol
+            for coord in coords[:-1]
+            for node in coord.atoms(sympy.Mod)
+        )
+    ):
+        return None
+
+    def can_normalize(stl, coordinates):
+        try:
+            normalize_coordinates(
+                dict(in_dep.ranges),
+                stl.device_size,
+                coordinates,
+                lambda: sympy.Dummy(integer=True, nonnegative=True),
+                indirect_sizes,
+                concretize_expr,
+            )
+        except (Unsupported, AssertionError):
+            return False
+        return True
+
+    if can_normalize(in_stl, coords):
+        return None
+    order = sorted(
+        range(len(in_stl.device_size) - 1),
+        key=lambda axis: in_stl.stride_map[axis],
+        reverse=True,
+    ) + [len(in_stl.device_size) - 1]
+    target = SpyreTensorLayout(
+        [in_stl.device_size[axis] for axis in order],
+        [in_stl.stride_map[axis] for axis in order],
+        in_stl.device_dtype,
+    )
+    target_coords = try_device_coordinates(target, in_dep, indirect_sizes)
+    if target_coords is not None:
+        padded_size = list(target.device_size)
+        fractional_padding: dict[int, sympy.Expr] = {}
+        _coalesce_quotient_remainder_dims(
+            padded_size, target_coords, padding_out=fractional_padding
+        )
+        for axis, extent in fractional_padding.items():
+            padded_size[axis] = extent
+        for axis, coord in enumerate(target_coords[:-1]):
+            parts = _strided_coordinate_parts(coord)
+            if parts is not None and padded_size[axis] % parts[0] != 0:
+                alignment = math.lcm(int(parts[0]), target.elems_per_stick())
+                padded_size[axis] = (
+                    (padded_size[axis] + alignment - 1) // alignment * alignment
+                )
+        target = SpyreTensorLayout(
+            padded_size, list(target.stride_map), target.device_dtype
+        )
+        target_coords = try_device_coordinates(target, in_dep, indirect_sizes)
+    out_coords = try_device_coordinates(out_stl, out_dep, indirect_sizes)
+    if (
+        target_coords is not None
+        and out_coords is not None
+        and stick_compatible([target_coords, out_coords])
+        and can_normalize(target, target_coords)
+    ):
+        return target
+    return None
+
+
 def compute_restickify_needed(
     in_stl: SpyreTensorLayout,
     in_host: FixedLayout,
@@ -2035,6 +2250,15 @@ def compute_restickify_needed(
     ind_names, _, ind_sizes = indirect_info_from_op(op)
     if in_dep.name in ind_names:
         return False, None
+    if strided_stick_host_dim(in_stl, in_host, in_dep, ind_sizes) is not None:
+        return True, compute_strided_view_restickify_target(
+            in_stl, in_host, in_dep, out_stl, out_dep, ind_sizes
+        )
+    fractional_target = compute_fractional_view_relayout_target(
+        in_stl, in_dep, out_stl, out_dep, ind_sizes
+    )
+    if fractional_target is not None:
+        return True, fractional_target
     idc = try_device_coordinates(in_stl, in_dep, ind_sizes)
     out_idc = try_device_coordinates(out_stl, out_dep, ind_sizes)
     if idc is None or out_idc is None:

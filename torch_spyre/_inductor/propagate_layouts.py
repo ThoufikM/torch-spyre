@@ -79,6 +79,7 @@ from .ir import (
 )
 from .pass_utils import (
     compute_restickify_target_layout,
+    compute_strided_view_restickify_target,
     concretize_expr,
     find_matmul_generated_var,
     find_reduction_var,
@@ -94,6 +95,7 @@ from .pass_utils import (
     is_topk,
     iter_var_id,
     rescale_stl_for_dtype,
+    strided_stick_host_dim,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .views import compute_coordinates, matching_dim
@@ -599,6 +601,32 @@ def _single_arg_op_layout(
             stl.element_arrangement,
         )
         return [stl]
+
+    if strided_stick_host_dim(stl, in_layout, dep) is not None:
+        # A strided stick can pass the symbolic check (Mod(3*i, 64)) yet
+        # require unsupported quotient/remainder alignment. Copy the full
+        # producer onto an unsliced stick axis before consuming the view.
+        stick_size = get_elem_in_stick(out_dtype_for_layout)
+        aligned, unaligned = _dims_by_alignment(
+            range(len(output.size)), output.size, stick_size
+        )
+        for dims in (aligned, unaligned):
+            candidates = []
+            for dim in dims:
+                output_stl = _make_output_stl(
+                    output, output_dep, c_size, c_stride, dim, out_dtype_for_layout
+                )
+                if (
+                    output_stl is not None
+                    and compute_strided_view_restickify_target(
+                        stl, in_layout, dep, output_stl, output_dep
+                    )
+                    is not None
+                ):
+                    candidates.append(output_stl)
+            if candidates:
+                return candidates
+        return []
 
     in_device_coords = try_device_coordinates(stl, dep, None)
     if in_device_coords is None:

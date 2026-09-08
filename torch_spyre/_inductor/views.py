@@ -247,6 +247,23 @@ def _decompose_constant_offset(
     return True
 
 
+def _coordinate_mod(value, modulus):
+    """Form an exact remainder without eager nested-Mod multiplication."""
+    if value.has(sympy.Mod):
+        scale, body = value.as_coeff_Mul()
+        if (
+            scale.is_Integer
+            and body.func == sympy.Mod
+            and (scale * body.args[1] % modulus) == 0
+        ):
+            # (s*(k%m))%q == (s*k)%q when q divides s*m.
+            return sympy.Mod(scale * body.args[0], modulus)
+        # SymPy versions with the nested-Mul Mod bug duplicate the inner
+        # Mod factor. Keep the exact floor identity instead of invoking it.
+        return value - modulus * sympy.floor(value / modulus)
+    return sympy.Mod(value, modulus)
+
+
 def compute_coordinates(
     size: Sequence[sympy.Expr],
     stride: Sequence[sympy.Expr],
@@ -295,7 +312,7 @@ def compute_coordinates(
     # compute coordinate expressions
     coordinates = [sympy.S.Zero] * n
 
-    def add_term(var, step, limit):
+    def add_term(var, step, limit, base_offset=sympy.S.Zero):
         # Concretize step and limit for comparison logic only.  The symbolic
         # ``step`` and ``limit`` are still used in the coordinate *output*
         # expressions (``var * step // st``), preserving symbolic output.
@@ -323,6 +340,16 @@ def compute_coordinates(
                 f"be expressed as a device coordinate"
             )
 
+        # limit is step * range, but the last accessed element is
+        # step * (range - 1). For a strided slice whose final group is partial,
+        # the unused tail must not introduce a coordinate in the next host
+        # dimension (e.g. 3*i, i<43, never reaches the boundary at 128).
+        # Keep the backwards-traversal check above on the original bounds.
+        if concrete_step > 1:
+            concrete_limit -= concrete_step - 1
+        concrete_limit += int(base_offset)
+        value = var * step + base_offset
+
         # find primary dim with largest stride less than or equal to step
         primary_stride = 0
         primary_dim = -1
@@ -338,29 +365,57 @@ def compute_coordinates(
                 # var range intersects dim, add term
                 if next_stride[dim] < concrete_limit:
                     # var range overflows dim
-                    coordinates[dim] += var * step % next_stride[dim] // st
+                    coordinates[dim] += _coordinate_mod(value, next_stride[dim]) // st
                 else:
-                    coordinates[dim] += var * step // st
+                    coordinates[dim] += value // st
         # add term for primary dim
         if primary_stride > 0:
             if next_stride[primary_dim] < concrete_limit:
                 coordinates[primary_dim] += (
                     # var range overflows primary dim
-                    var * step % next_stride[primary_dim] // primary_stride
+                    _coordinate_mod(value, next_stride[primary_dim]) // primary_stride
                 )
             else:
-                coordinates[primary_dim] += var * step // primary_stride
+                coordinates[primary_dim] += value // primary_stride
 
     vars = index.free_symbols
     offset = index.xreplace({v: 0 for v in vars})
+    shifted_var = None
     if offset > 0:
         index = index - offset
+        # An affine slice offset belongs inside quotient/remainder operations.
+        # Adding it to already split digits loses carries (e.g. 5*k+63 over
+        # a 64-element digit). Attach it to the fastest affine loop term.
+        if not repeat_info and not offset.free_symbols:
+            candidates = []
+            for var in vars:
+                coefficient = index.coeff(var)
+                if (
+                    var not in var_ranges
+                    or _concretize_for_cmp(var_ranges[var]) <= 1
+                    or coefficient.is_Integer is not True
+                    or coefficient <= 0
+                ):
+                    continue
+                primary = max(
+                    (
+                        st
+                        for extent, st in zip(size, stride)
+                        if extent > 1 and 0 < st <= coefficient
+                    ),
+                    default=0,
+                )
+                if primary and coefficient > primary and offset % primary == 0:
+                    candidates.append(var)
+            if candidates:
+                shifted_var = min(candidates, key=lambda var: index.coeff(var))
         # A concrete offset is decomposed positionally so a padded layout does
         # not leak a modular residual onto the stick coordinate (see
         # _decompose_constant_offset).  Symbolic offsets, or an offset that
         # cannot be fully peeled, fall back to add_term's original behavior.
-        handled = not offset.free_symbols and _decompose_constant_offset(
-            offset, size, stride, coordinates
+        handled = shifted_var is not None or (
+            not offset.free_symbols
+            and _decompose_constant_offset(offset, size, stride, coordinates)
         )
         if not handled:
             add_term(var=offset, step=sympy.S.One, limit=sympy.oo)
@@ -419,7 +474,12 @@ def compute_coordinates(
                 f"expressions {mods_with_var} and cannot be mapped to coordinates."
             )
 
-        add_term(var=var, step=step, limit=limit)
+        add_term(
+            var=var,
+            step=step,
+            limit=limit,
+            base_offset=offset if var == shifted_var else sympy.S.Zero,
+        )
 
     # NOTE: indirect_access_subs substitution is NOT applied here. It is deferred to
     # after align_tensors() so that indirect symbols are decomposed as regular variables.
@@ -495,6 +555,165 @@ class Term:
     offset: sympy.Expr = sympy.S.Zero  # offset
 
 
+def _strided_coordinate_parts(coord):
+    """Recognize s*k+b or s*(k%m)+b with a positive integer step."""
+    offset, term = coord.as_coeff_Add()
+    scale, body = term.as_coeff_Mul()
+    if (
+        scale.is_Integer is not True
+        or scale <= 1
+        or offset.is_Integer is not True
+        or offset < 0
+    ):
+        return None
+    if body.is_Symbol or (
+        body.func == sympy.Mod
+        and body.args[0].is_Symbol
+        and body.args[1].is_Integer is True
+        and body.args[1] > 0
+    ):
+        return scale, body, offset
+    return None
+
+
+def _coalesce_quotient_remainder_dims(
+    size: Sequence[sympy.Expr],
+    coordinates: Sequence[sympy.Expr],
+    padding_out: dict[int, sympy.Expr] | None = None,
+) -> tuple[list[sympy.Expr], list[sympy.Expr]]:
+    """Remove fractional coordinates when adjacent physical dims cancel them.
+
+    For a non-stick pair with inner size q, q*floor(x/q) + x%q is exactly x.
+    Coalescing the pair preserves every physical address, including carries
+    from a non-unit fraction such as floor(3*i/64). Never coalesce the stick:
+    its boundary is part of the hardware layout, not just a reshape choice.
+    """
+
+    def collapse_nested_floor(expr):
+        # floor((floor(x) + b) / n) == floor((x + b) / n) for
+        # integer b and positive integer n. This is exact, including carries.
+        numerator, denominator = expr.args[0].as_numer_denom()
+        offset, body = numerator.as_coeff_Add()
+        if (
+            denominator.is_Integer is True
+            and denominator > 0
+            and offset.is_Integer is True
+            and body.func == sympy.floor
+        ):
+            expr = sympy.floor((body.args[0] + offset) / denominator)
+        if expr.func == sympy.floor:
+            argument = sympy.expand(expr.args[0])
+            integers = sympy.Add(
+                *(
+                    term
+                    for term in sympy.Add.make_args(argument)
+                    if term.is_integer is True
+                )
+            )
+            constant, body = (argument - integers).as_coeff_Add()
+            whole = sympy.floor(constant)
+            return integers + whole + sympy.floor(body + constant - whole)
+        return expr
+
+    size, coordinates = list(size), list(coordinates)
+    original_size = list(size)
+    origins = list(range(len(size)))
+    dim = 0
+    while dim + 1 < len(size) - 1:
+        # A digit chain may span more than two dimensions. Flatten consecutive
+        # non-stick dimensions symbolically and only accept an exact affine
+        # or periodic strided result. Rewriting Mod as a floor identity cancels
+        # all carries, including intermediate digits such as floor(x/8) % 8.
+        if not coordinates[dim].has(sympy.floor, FloorDiv):
+            dim += 1
+            continue
+        merged = coordinates[dim]
+        extent = size[dim]
+        for end in range(dim + 1, len(size) - 1):
+            merged = size[end] * merged + coordinates[end]
+            merged = merged.replace(
+                lambda expr: isinstance(expr, FloorDiv),
+                lambda expr: sympy.floor(expr.args[0] / expr.args[1]),
+            )
+            merged = merged.rewrite(sympy.floor).replace(
+                lambda expr: expr.func == sympy.floor, collapse_nested_floor
+            )
+            merged = sympy.expand(merged)
+            extent *= size[end]
+            if len(merged.free_symbols) != 1:
+                continue
+            var = next(iter(merged.free_symbols))
+            scale = merged.coeff(var)
+            offset = merged.subs(var, 0)
+            candidate = merged
+            # Reconstruct a periodic coordinate after carry cancellation:
+            # s*k - s*m*floor(k/m) == s*(k%m). Verify the identity rather
+            # than assuming that every remaining floor denotes a wrap.
+            floors = merged.atoms(sympy.floor)
+            if len(floors) == 1:
+                floor = next(iter(floors))
+                numerator, modulus = floor.args[0].as_numer_denom()
+                if numerator == var and modulus.is_Integer and modulus > 0:
+                    periodic = scale * sympy.Mod(var, modulus) + offset
+                    if sympy.expand(periodic.rewrite(sympy.floor) - merged) == 0:
+                        candidate = periodic
+            parts = _strided_coordinate_parts(candidate)
+            if parts is None:
+                continue
+            if extent % parts[0] != 0:
+                if padding_out is None:
+                    continue
+                # Plan padding on the outermost original digit, preserving
+                # every inner radix. The caller must allocate and copy this
+                # larger layout before using the resulting normalization.
+                origin = origins[dim]
+                old_outer = original_size[origin]
+                inner_span = extent // old_outer
+                multiple = parts[0] // sympy.gcd(inner_span, parts[0])
+                new_outer = (old_outer + multiple - 1) // multiple * multiple
+                padding_out[origin] = new_outer
+                original_size[origin] = new_outer
+                extent = new_outer * inner_span
+            size[dim : end + 1] = [extent]
+            coordinates[dim : end + 1] = [candidate]
+            origins[dim : end + 1] = [origins[dim]]
+            dim = max(dim - 1, 0)
+            break
+        else:
+            dim += 1
+
+    return size, coordinates
+
+
+def _factor_affine_gaps(
+    size: Sequence[sympy.Expr], coordinates: Sequence[sympy.Expr]
+) -> tuple[list[sympy.Expr], list[sympy.Expr]]:
+    """Factor a strided non-stick dimension without changing its storage span.
+
+    A physical dimension of N elements accessed at s*i+b becomes dimensions
+    (N/s, s) accessed at (i+b//s, b%s). The lane dimension is never factored.
+    The same factoring applies with i replaced by i%m. Non-divisible spans
+    must be padded by the producer before this transform.
+    """
+    new_size: list[sympy.Expr] = []
+    new_coords: list[sympy.Expr] = []
+    for dim, (extent, coord) in enumerate(zip(size, coordinates)):
+        parts = _strided_coordinate_parts(coord)
+        if dim != len(size) - 1 and parts is not None:
+            scale, body, offset = parts
+            if extent % scale != 0:
+                raise Unsupported(
+                    f"strided device dimension of size {extent} must be padded "
+                    f"to a multiple of step {scale} before alignment"
+                )
+            new_size.extend((extent // scale, scale))
+            new_coords.extend((body + offset // scale, offset % scale))
+            continue
+        new_size.append(extent)
+        new_coords.append(coord)
+    return new_size, new_coords
+
+
 def normalize_coordinates(
     var_ranges: dict[sympy.Symbol, sympy.Expr],
     size: Sequence[sympy.Expr],
@@ -507,7 +726,8 @@ def normalize_coordinates(
     Normalize coordinate expressions obtained from compute_coordinates.
 
     If mod is absent from term assume term does not overflow dim_size.
-    Assume num or den is 1.
+    Coalesce representable non-unit digit chains before normalizing terms.
+    Remaining terms require num or den to be 1.
 
     Break each expression into list of terms.
     If expr has no mod, use var_range instead.
@@ -533,6 +753,8 @@ def normalize_coordinates(
             coeff, body = term.args
             # TODO: handle non-unit fractions
             # https://github.com/torch-spyre/torch-spyre/issues/1353
+            print("Normalized Coeff:", coeff)
+            print("Normalized Body:", body)
             assert coeff.numerator == 1 or coeff.denominator == 1, (
                 f"Unsupported coordinate expression {term}"
             )
@@ -564,6 +786,9 @@ def normalize_coordinates(
             modulus,
             dim_size,
         )
+
+    size, coordinates = _coalesce_quotient_remainder_dims(size, coordinates)
+    size, coordinates = _factor_affine_gaps(size, coordinates)
 
     # terms in non-increasing stride order
     terms = []

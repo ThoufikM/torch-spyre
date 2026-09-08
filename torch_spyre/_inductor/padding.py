@@ -634,7 +634,16 @@ def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
     # TODO: support this by restickifying into a fresh temp buffer sized to a stick
     # multiple, then cloning that buffer into the slice.
     host_dim_size = concretize_expr(write_dep.ranges[old_sym])
-    if host_dim_size < unpadded_dim_size:
+    # A fresh full-buffer copy may already include physical padding chosen
+    # for a downstream strided view. Its logical extent is smaller than its
+    # allocation, but this is not a partial mutation of somebody else's buffer.
+    host_coords = host_coordinates(out_layout, write_dep, None)
+    full_output_dim = any(
+        coord == old_sym and concretize_expr(size) == host_dim_size
+        for coord, size in zip(host_coords, out_layout.size)
+    )
+    owns_full_output = isinstance(op.layout, FixedTiledLayout) and full_output_dim
+    if host_dim_size < unpadded_dim_size and not owns_full_output:
         raise Unsupported(
             f"insert_restickify_padding: sliced output on {op.get_name()} "
             f"(written size {host_dim_size} < device dim size {unpadded_dim_size}) "
