@@ -674,6 +674,13 @@ Environment Variables
    * - ``LX_PLANNING``
      - Enable LX scratchpad planning (default ``1``; set ``0`` to skip the
        ``scratchpad_planning`` pass)
+   * - ``SPYRE_LX_PLANNER_RELAYOUT``
+     - Enable certified LX-to-LX movement, exact fused-axis views,
+       consumer-compatible producer ordering and same-core restickify
+       residency (default ``1``). Set ``0`` to disable these optional
+       optimizations; ownership and capacity checks remain active. Allocator
+       selection and the LX budget are unchanged. Unsupported ownership or
+       insufficient space still uses HBM.
    * - ``CO_OPTIMIZING_LX_PLANNING``
      - Use the co-optimizing LX allocator strategy (default ``0``)
    * - ``HBM_POOL_PLANNING``
@@ -724,6 +731,29 @@ Environment Variables
        alternative to ``SPYRE_INDUCTOR_IGNORE_HINTS``.  Defaults to
        ``1`` (disabled/opt-in): set to ``0`` to enable automatic
        span-overflow coarse tiling.
+   * - ``SPYRE_INDUCTOR_SDSC_CACHE``
+     - Cache and reuse ``sdsc.json`` files during codegen when two OpSpecs
+       produce identical SuperDSC content, reducing bundle size for
+       programs with loops (default ``1``; set ``0`` to disable)
+   * - ``SPYRE_VALIDATE_OP_SPECS``
+     - Validate OpSpecs at pipeline stage boundaries to catch invariant
+       violations early (default ``1``; set ``0`` to disable)
+   * - ``SPYRE_CONV2D_DIRECT``
+     - Emit a native conv2d SDSC (``opFuncName="conv2d"`` on the ``pt``
+       unit) instead of the im2col + matmul decomposition. Off by default
+       (``0``); the decomposition remains the default path and the fallback
+       for grouped, transposed, or non-fp16 cases
+   * - ``SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT``
+     - For a strided direct-lowered conv2d, forbid splitting the output
+       spatial dims across cores so each core computes whole spatial rows
+       and columns (default ``1``; set ``0`` to opt out)
+   * - ``TORCH_SPYRE_KTIR``
+     - Opt-in OpSpec-to-KTIR emitter (experimental). When enabled the
+       scheduler emits ``async_compile.ktir(...)`` instead of the SDSC
+       bundle; inert by default (``0``), leaving the SDSC path unchanged
+   * - ``KTIR_DEVICE_MLIR``
+     - Path to a ``.mlir`` file declaring the target device for the KTIR
+       execution path (default empty)
 
 **Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
 
