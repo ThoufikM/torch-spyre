@@ -1891,18 +1891,18 @@ def spyre_pow_tensor_scalar(
 
     # int, float, or SymFloat depending on the trace, and not stable across runs.
     e = float(exponent)
-    if e == 1.0:
+    if math.isclose(e, 1.0, rel_tol=1e-09, abs_tol=1e-09):
         # Returning the input rather than a copy is legal because a
         # decomposition runs on a functionalized graph; callers must not rely on
         # either identity, since aten's contract is only that the value matches.
         return input
-    if e == -1.0:
+    if math.isclose(e, -1.0, rel_tol=1e-09, abs_tol=1e-09):
         return torch.reciprocal(input)
-    if e == 0.5:
+    if math.isclose(e, 0.5, rel_tol=1e-09, abs_tol=1e-09):
         return torch.sqrt(input)
-    if e == -0.5:
+    if math.isclose(e, -0.5, rel_tol=1e-09, abs_tol=1e-09):
         return torch.rsqrt(input)
-    if e == 0.0:
+    if math.isclose(e, 0.0, rel_tol=1e-09, abs_tol=1e-09):
         return torch.ones_like(input)
     if e.is_integer():
         magnitude = _pow_by_squaring(input, abs(int(e)))
@@ -2428,8 +2428,90 @@ def _windowed_attention(
     )
     finite_min = torch.finfo(storage_dtype).min
     positive_min = torch.finfo(storage_dtype).tiny
-    out_blocks = []
+
+    def kv_level(q_tile, k_tile, v_tile, mask_tile):
+        if use_gqa:
+            k_tile = k_tile.unsqueeze(2)
+            v_tile = v_tile.unsqueeze(2)
+
+        # Q and the carry seeds are invariant across the counted K/V loop.
+        # A finite maximum keeps fully masked chunks defined: their
+        # exponentials and weighted contribution are exactly zero.
+        q_scaled = q_tile * query_scale
+        output_tile = torch.zeros_like(q_tile)
+        accumulator_shape = (*q_tile.shape[:-1], STICK)
+        running_max_reduced = torch.full(
+            accumulator_shape,
+            finite_min,
+            device=query.device,
+            dtype=query.dtype,
+        )
+        running_max = running_max_reduced.amax(dim=-1)
+        denominator_reduced = torch.zeros(
+            accumulator_shape,
+            device=query.device,
+            dtype=query.dtype,
+        )
+        denominator = denominator_reduced.amax(dim=-1)
+
+        def swa_kv_body(carry, tiles):
+            running_max, denominator, output = carry
+            _, k_blk, v_blk, mask_blk = tiles
+            # Match full SDPA: the scan walks K in cache order and
+            # materializes only the bounded, transposed tile required by
+            # the score matmul.
+            keys_t = k_blk.transpose(-1, -2).contiguous()
+            scores = (
+                torch.ops.spyre.batched_matmul(q_scaled, keys_t)
+                if use_gqa
+                else torch.matmul(q_scaled, keys_t)
+            )
+            scores = scores + mask_blk
+
+            # Clamp before reducing so fully masked chunks do not form
+            # ``-inf - -inf`` in the online-softmax recurrence.
+            block_max = torch.amax(torch.clamp_min(scores, finite_min), dim=-1)
+            # Form the old-max correction first. The loop lowering can then
+            # update running_max without a carry snapshot.
+            correction = torch.exp(torch.clamp_max(running_max - block_max, 0.0))
+            new_max = torch.maximum(running_max, block_max)
+            exp_scores = torch.exp(scores - new_max.unsqueeze(-1))
+            new_denominator = denominator * correction + exp_scores.sum(dim=-1)
+            exp_scores = exp_scores.contiguous()
+            weighted = (
+                torch.ops.spyre.batched_matmul(exp_scores, v_blk)
+                if use_gqa
+                else torch.matmul(exp_scores, v_blk)
+            )
+            new_output = output * correction.unsqueeze(-1) + weighted
+            return (new_max, new_denominator, new_output), None
+
+        kv_operands = (q_tile, k_tile, v_tile, mask_tile)
+        initial = (running_max, denominator, output_tile)
+        if tiling.num_kv_blocks == 1:
+            (_, denominator, output_tile), _ = swa_kv_body(initial, kv_operands)
+        else:
+            (_, denominator, output_tile), _ = for_each_tile(
+                swa_kv_body,
+                kv_operands,
+                dims=(None, -2, -2, -1),
+                tile_size=tiling.kv_block_size,
+                init=initial,
+            )
+        safe_denominator = torch.clamp_min(denominator, positive_min)
+        return output_tile / safe_denominator.unsqueeze(-1)
+
     num_q_blocks = padded_seqlen_q // q_block
+
+    # Collect every block's operands first instead of padding and
+    # concatenating incrementally inside the loop: each pad/cat here would
+    # otherwise re-run per block even though pad_columns is loop-invariant.
+    # Gathering into lists and padding the stacked batch once replaces N
+    # small cats with a single one.
+    q_rows_list = []
+    k_windows = []
+    v_windows = []
+    mask_windows = []
     for block_index in range(num_q_blocks):
         q_start = block_index * q_block
         q_end = q_start + q_block
@@ -2455,117 +2537,58 @@ def _windowed_attention(
             num_heads,
         )
         mask_window = mask_rows[..., read_start : read_start + buffer_width]
-        if pad_columns:
-            k_window = torch.cat(
-                [
-                    k_window,
-                    torch.zeros(
-                        (*k_window.shape[:-2], pad_columns, k_window.shape[-1]),
-                        device=k_window.device,
-                        dtype=k_window.dtype,
-                    ),
-                ],
-                dim=-2,
-            )
-            v_window = torch.cat(
-                [
-                    v_window,
-                    torch.zeros(
-                        (*v_window.shape[:-2], pad_columns, v_window.shape[-1]),
-                        device=v_window.device,
-                        dtype=v_window.dtype,
-                    ),
-                ],
-                dim=-2,
-            )
-            mask_window = torch.cat(
-                [
-                    mask_window,
-                    torch.full(
-                        (*mask_window.shape[:-1], pad_columns),
-                        float("-inf"),
-                        device=mask_window.device,
-                        dtype=mask_window.dtype,
-                    ),
-                ],
-                dim=-1,
-            )
 
-        q_rows = query[..., q_start:q_end, :]
+        q_rows_list.append(query[..., q_start:q_end, :])
+        k_windows.append(k_window)
+        v_windows.append(v_window)
+        mask_windows.append(mask_window)
 
-        def kv_level(q_tile, k_tile, v_tile, mask_tile):
-            if use_gqa:
-                k_tile = k_tile.unsqueeze(2)
-                v_tile = v_tile.unsqueeze(2)
+    if pad_columns:
+        k_stack = torch.stack(k_windows)
+        v_stack = torch.stack(v_windows)
+        mask_stack = torch.stack(mask_windows)
+        k_stack = torch.cat(
+            [
+                k_stack,
+                torch.zeros(
+                    (*k_stack.shape[:-2], pad_columns, k_stack.shape[-1]),
+                    device=k_stack.device,
+                    dtype=k_stack.dtype,
+                ),
+            ],
+            dim=-2,
+        )
+        v_stack = torch.cat(
+            [
+                v_stack,
+                torch.zeros(
+                    (*v_stack.shape[:-2], pad_columns, v_stack.shape[-1]),
+                    device=v_stack.device,
+                    dtype=v_stack.dtype,
+                ),
+            ],
+            dim=-2,
+        )
+        mask_stack = torch.cat(
+            [
+                mask_stack,
+                torch.full(
+                    (*mask_stack.shape[:-1], pad_columns),
+                    float("-inf"),
+                    device=mask_stack.device,
+                    dtype=mask_stack.dtype,
+                ),
+            ],
+            dim=-1,
+        )
+        k_windows = list(k_stack.unbind(0))
+        v_windows = list(v_stack.unbind(0))
+        mask_windows = list(mask_stack.unbind(0))
 
-            # Q and the carry seeds are invariant across the counted K/V loop.
-            # A finite maximum keeps fully masked chunks defined: their
-            # exponentials and weighted contribution are exactly zero.
-            q_scaled = q_tile * query_scale
-            output_tile = torch.zeros_like(q_tile)
-            accumulator_shape = (*q_tile.shape[:-1], STICK)
-            running_max_reduced = torch.full(
-                accumulator_shape,
-                finite_min,
-                device=query.device,
-                dtype=query.dtype,
-            )
-            running_max = running_max_reduced.amax(dim=-1)
-            denominator_reduced = torch.zeros(
-                accumulator_shape,
-                device=query.device,
-                dtype=query.dtype,
-            )
-            denominator = denominator_reduced.amax(dim=-1)
-
-            def swa_kv_body(carry, tiles):
-                running_max, denominator, output = carry
-                _, k_blk, v_blk, mask_blk = tiles
-                # Match full SDPA: the scan walks K in cache order and
-                # materializes only the bounded, transposed tile required by
-                # the score matmul.
-                keys_t = k_blk.transpose(-1, -2).contiguous()
-                scores = (
-                    torch.ops.spyre.batched_matmul(q_scaled, keys_t)
-                    if use_gqa
-                    else torch.matmul(q_scaled, keys_t)
-                )
-                scores = scores + mask_blk
-
-                # Clamp before reducing so fully masked chunks do not form
-                # ``-inf - -inf`` in the online-softmax recurrence.
-                block_max = torch.amax(torch.clamp_min(scores, finite_min), dim=-1)
-                # Form the old-max correction first. The loop lowering can then
-                # update running_max without a carry snapshot.
-                correction = torch.exp(torch.clamp_max(running_max - block_max, 0.0))
-                new_max = torch.maximum(running_max, block_max)
-                exp_scores = torch.exp(scores - new_max.unsqueeze(-1))
-                new_denominator = denominator * correction + exp_scores.sum(dim=-1)
-                exp_scores = exp_scores.contiguous()
-                weighted = (
-                    torch.ops.spyre.batched_matmul(exp_scores, v_blk)
-                    if use_gqa
-                    else torch.matmul(exp_scores, v_blk)
-                )
-                new_output = output * correction.unsqueeze(-1) + weighted
-                return (new_max, new_denominator, new_output), None
-
-            kv_operands = (q_tile, k_tile, v_tile, mask_tile)
-            initial = (running_max, denominator, output_tile)
-            if tiling.num_kv_blocks == 1:
-                (_, denominator, output_tile), _ = swa_kv_body(initial, kv_operands)
-            else:
-                (_, denominator, output_tile), _ = for_each_tile(
-                    swa_kv_body,
-                    kv_operands,
-                    dims=(None, -2, -2, -1),
-                    tile_size=tiling.kv_block_size,
-                    init=initial,
-                )
-            safe_denominator = torch.clamp_min(denominator, positive_min)
-            return output_tile / safe_denominator.unsqueeze(-1)
-
-        out_blocks.append(kv_level(q_rows, k_window, v_window, mask_window))
+    out_blocks = [
+        kv_level(q_rows_list[i], k_windows[i], v_windows[i], mask_windows[i])
+        for i in range(num_q_blocks)
+    ]
 
     output = torch.cat(out_blocks, dim=-2)
     return output.flatten(1, 2) if use_gqa else output
