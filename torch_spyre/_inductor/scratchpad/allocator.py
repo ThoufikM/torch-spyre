@@ -2534,7 +2534,7 @@ def _check_and_add_matmul_options(
     parsed = _matmul_axis_parse(op)
     options = {_candidate_key(seed): seed}
     for source in matmul_roles:
-        candidate = {sym: 1 for sym in iteration_space_from_op(op)}
+        candidate = dict.fromkeys(iteration_space_from_op(op), 1)
         for role, (sym, extent, _factor) in parsed.items():
             factor = source.get(role, 1)
             candidate[sym] = factor if factor > 1 and extent % factor == 0 else 1
