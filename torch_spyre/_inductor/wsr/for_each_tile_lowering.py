@@ -510,10 +510,39 @@ def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Ex
     wrong-answer this module exists to prevent elsewhere. Guard against it
     explicitly: raise rather than let two dims collide on one recovered
     coordinate.
+
+    A dim's load-site coordinate can itself be a compile-time-constant
+    integer rather than a loop-index symbol -- e.g. a Python-level ``t[j]``
+    select with a literal ``j`` (unrolled, so ``j`` never becomes a traced
+    variable). ``sympy.expand`` folds such a term's ``j * stride[i]`` into
+    one bare integer alongside every other constant contribution, so by the
+    time ``remaining`` is formed there is no surviving symbolic factor of
+    ``stride[i]`` for ``.coeff(stride[i])`` to find. ``Expr.coeff(n)`` for a
+    plain-integer ``n`` only recognizes ``n`` as an explicit multiplicative
+    term (coefficient exactly 1) or its absence (coefficient 0) -- it does
+    not factor an arbitrary integer multiple of ``n`` out of a bare number,
+    so e.g. ``(16384).coeff(8192)`` is ``0``, not ``2``. Left unguarded, this
+    silently recovers ``0`` for every such dim whose true index is ``>= 2``,
+    aliasing it onto whatever consumes coordinate ``0`` (issue #5311: `t[1][j]`
+    for `j >= 2` read `t[1][0]`'s data instead).
+
+    Dims with a genuine loop-index symbol are unaffected: `.coeff()` extracts
+    their coefficient structurally via that symbol, independent of its value.
+    Only dims with NO surviving free symbol in `remaining` need the constant
+    decomposed separately -- done by peeling the combined constant apart in
+    decreasing-stride order (the same mixed-radix approach tile.py's
+    ``compute_tile_offset`` uses for an analogous host-offset decomposition).
     """
     remaining = sympy.expand(index - offset)
-    coords: list[sympy.Expr] = []
+    free_syms = remaining.free_symbols
+    # The portion of `remaining` not tied to any loop-index symbol: every
+    # constant-coordinate dim's own contribution lives somewhere in here.
+    const_total = int(remaining.xreplace({s: sympy.S.Zero for s in free_syms}))
+    symbolic_remaining = sympy.expand(remaining - const_total)
+
+    coords: list[sympy.Expr | None] = []
     seen_strides: dict[sympy.Expr, int] = {}
+    const_dims: list[int] = []
     for i, (sz, st) in enumerate(zip(size, stride)):
         if sz == 1:
             coords.append(sympy.Integer(0))
@@ -527,15 +556,30 @@ def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Ex
             )
         if st != 0:
             seen_strides[st] = i
-        # A size>1 broadcast dim (stride 0) contributes no term to
-        # `remaining` and its coordinate is always 0 -- but that must be
-        # special-cased rather than falling into the general
-        # `remaining.coeff(st)` branch below: sympy's `.coeff(0)` does not
-        # mean "coefficient of the constant term" here, it returns the
-        # WHOLE `remaining` expression unchanged. Using `remaining.coeff(st)`
-        # unconditionally would silently smuggle the entire remaining sum
-        # into this one dim's "coordinate" instead of 0.
-        coords.append(remaining.coeff(st) if st != 0 else sympy.Integer(0))
+        if st == 0:
+            # A size>1 broadcast dim contributes no term to `remaining` and
+            # its coordinate is always 0 -- special-cased because sympy's
+            # `.coeff(0)` does not mean "coefficient of the constant term"
+            # here, it returns the WHOLE expression unchanged.
+            coords.append(sympy.Integer(0))
+            continue
+        sym_coeff = symbolic_remaining.coeff(st)
+        if sym_coeff != 0:
+            coords.append(sym_coeff)
+        else:
+            # No surviving symbol carries this dim's stride: either it is
+            # genuinely absent (coordinate 0) or its coordinate is a literal
+            # constant folded into const_total above. Resolved below, once
+            # every constant dim is known, by peeling const_total apart from
+            # the largest stride down.
+            const_dims.append(i)
+            coords.append(None)
+
+    const_residual = const_total
+    for i in sorted(const_dims, key=lambda d: stride[d], reverse=True):
+        st = int(stride[i])
+        digit, const_residual = divmod(const_residual, st)
+        coords[i] = sympy.Integer(digit)
     return coords
 
 
@@ -646,6 +690,7 @@ class _InlineMarkerHandler(WrapperHandler):
     def load(self, name, index):
         if name == self._marker_name:
             coords = _delinearize_index(index, self._size, self._stride, self._offset)
+            print(f"[CLAUDE_DEBUG_WSR] coords={coords}")
             if (
                 self._capture is not None
                 and self._marker_dim is not None
