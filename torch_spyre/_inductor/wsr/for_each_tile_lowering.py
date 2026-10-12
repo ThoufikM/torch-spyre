@@ -690,7 +690,6 @@ class _InlineMarkerHandler(WrapperHandler):
     def load(self, name, index):
         if name == self._marker_name:
             coords = _delinearize_index(index, self._size, self._stride, self._offset)
-            print(f"[CLAUDE_DEBUG_WSR] coords={coords}")
             if (
                 self._capture is not None
                 and self._marker_dim is not None
