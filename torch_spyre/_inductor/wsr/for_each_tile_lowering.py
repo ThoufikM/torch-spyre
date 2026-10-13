@@ -485,59 +485,45 @@ def _marker_axis_is_consumed(axis_coords: "list[sympy.Expr] | None") -> bool:
 def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Expr]:
     """Invert a FixedLayout-style flat index back into per-dim coordinates.
 
-    ``ops.load(name, index)`` always receives ``index`` already flattened
-    to a single sympy expression by the loaded buffer's own
-    ``make_indexer()`` -- see ``Buffer.make_loader``/``_fixed_indexer`` --
-    never the original ``Sequence[Expr]`` coordinate list a ``Loops``
-    ``inner_fn``'s own index is parameterized by. Inlining the marker's
-    own read (see ``_InlineMarkerHandler``) needs that coordinate list
-    back, so undo ``_fixed_indexer``'s ``sum(idx[i] * stride[i]) +
-    offset`` here: every per-dim loop-index symbol (``i0``, ``r0``, ``d0``,
-    ...) appears in exactly one additive term of that sum with
-    coefficient ``stride[i]`` (the same one-symbol-per-term linearity
-    every coordinate-recovery helper in this package already assumes --
-    see coarse_tile.py's ``_loop_var_to_ranges_pos``/the deleted
-    ``_loop_var_pos_from_reads``), so dividing each matched term by its
-    own stride recovers ``idx[i]`` directly; a size-1 dim contributes no
-    term at all (``_fixed_indexer`` skips it), so its coordinate is
-    simply 0.
+    ``ops.load(name, index)`` receives ``index`` already flattened by the
+    loaded buffer's own indexer into ``sum(idx[i] * stride[i]) + offset``;
+    this undoes that. Every per-dim loop-index symbol appears in exactly
+    one additive term with coefficient ``stride[i]`` (the same one-symbol-
+    per-term linearity every coordinate-recovery helper in this package
+    already assumes), so dividing each matched term by its own stride
+    recovers ``idx[i]`` directly; a size-1 dim contributes no term, so its
+    coordinate is simply 0.
 
-    Two distinct dims sharing the same non-zero stride literal (a
-    degenerate/unusual layout, not observed against any fixture in this
-    repo, but not structurally impossible either) would make
-    ``remaining.coeff(st)`` silently SUM both dims' coefficients into one
-    merged coordinate instead of raising -- exactly the kind of silent
-    wrong-answer this module exists to prevent elsewhere. Guard against it
-    explicitly: raise rather than let two dims collide on one recovered
-    coordinate.
+    A dim's coordinate can also be a compile-time-constant integer rather
+    than a loop-index symbol -- e.g. an unrolled Python-level ``t[j]``
+    select. ``sympy.expand`` folds such a term into a bare integer, so
+    ``.coeff(stride[i])`` can't find it: ``Expr.coeff(n)`` for a plain
+    integer ``n`` only recognizes an explicit multiplicative term, e.g.
+    ``(16384).coeff(8192)`` is ``0``, not ``2``. Left unguarded, every such
+    dim would recover coordinate 0 regardless of its true value (issue
+    #5311: ``t[1][j]`` for ``j >= 2`` read ``t[1][0]``'s data instead).
+    Only dims with no surviving free symbol need their constant decomposed
+    separately -- peeled apart in decreasing-stride order, the same
+    mixed-radix approach ``tile.py``'s ``compute_tile_offset`` uses.
 
-    A dim's load-site coordinate can itself be a compile-time-constant
-    integer rather than a loop-index symbol -- e.g. a Python-level ``t[j]``
-    select with a literal ``j`` (unrolled, so ``j`` never becomes a traced
-    variable). ``sympy.expand`` folds such a term's ``j * stride[i]`` into
-    one bare integer alongside every other constant contribution, so by the
-    time ``remaining`` is formed there is no surviving symbolic factor of
-    ``stride[i]`` for ``.coeff(stride[i])`` to find. ``Expr.coeff(n)`` for a
-    plain-integer ``n`` only recognizes ``n`` as an explicit multiplicative
-    term (coefficient exactly 1) or its absence (coefficient 0) -- it does
-    not factor an arbitrary integer multiple of ``n`` out of a bare number,
-    so e.g. ``(16384).coeff(8192)`` is ``0``, not ``2``. Left unguarded, this
-    silently recovers ``0`` for every such dim whose true index is ``>= 2``,
-    aliasing it onto whatever consumes coordinate ``0`` (issue #5311: `t[1][j]`
-    for `j >= 2` read `t[1][0]`'s data instead).
-
-    Dims with a genuine loop-index symbol are unaffected: `.coeff()` extracts
-    their coefficient structurally via that symbol, independent of its value.
-    Only dims with NO surviving free symbol in `remaining` need the constant
-    decomposed separately -- done by peeling the combined constant apart in
-    decreasing-stride order (the same mixed-radix approach tile.py's
-    ``compute_tile_offset`` uses for an analogous host-offset decomposition).
+    Raises ``AssertionError`` if two dims share a non-zero stride, if the
+    constant portion doesn't decompose evenly across the constant dims, or
+    if a recovered digit is out of bounds for its dim's size -- all three
+    indicate the one-symbol/one-stride-per-term assumption above doesn't
+    hold for this index.
     """
     remaining = sympy.expand(index - offset)
     free_syms = remaining.free_symbols
     # The portion of `remaining` not tied to any loop-index symbol: every
     # constant-coordinate dim's own contribution lives somewhere in here.
-    const_total = int(remaining.xreplace({s: sympy.S.Zero for s in free_syms}))
+    const_total_expr = remaining.xreplace({s: sympy.S.Zero for s in free_syms})
+    if not const_total_expr.is_Integer:
+        raise AssertionError(
+            f"_delinearize_index: constant portion of index {index!r} "
+            f"(offset {offset!r}) is {const_total_expr!r}, not an integer; "
+            "cannot decompose it into per-dim coordinates."
+        )
+    const_total = int(const_total_expr)
     symbolic_remaining = sympy.expand(remaining - const_total)
 
     coords: list[sympy.Expr | None] = []
@@ -579,7 +565,24 @@ def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Ex
     for i in sorted(const_dims, key=lambda d: stride[d], reverse=True):
         st = int(stride[i])
         digit, const_residual = divmod(const_residual, st)
+        if digit < 0 or digit >= size[i]:
+            raise AssertionError(
+                f"_delinearize_index: recovered coordinate {digit} for dim "
+                f"{i} is out of bounds for size {size[i]!r} (index "
+                f"{index!r}, offset {offset!r}, const_total {const_total!r})."
+            )
         coords[i] = sympy.Integer(digit)
+    if const_residual != 0:
+        raise AssertionError(
+            f"_delinearize_index: {const_residual} left over after "
+            f"decomposing the constant portion of index {index!r} (offset "
+            f"{offset!r}) across const dims {const_dims!r}; cannot recover "
+            "distinct per-dim coordinates for this index."
+        )
+    assert all(c is not None for c in coords), (
+        f"_delinearize_index: unresolved coordinate for index {index!r} "
+        f"(size {size!r}, stride {stride!r}, offset {offset!r})"
+    )
     return coords
 
 
