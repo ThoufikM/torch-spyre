@@ -315,7 +315,7 @@ PYBIND11_MODULE(_C, m) {
       .def("__repr__",
            [](const spyre::SpyreTensorLayout& c) { return c.toString(); })
       .def("elems_per_stick", &spyre::SpyreTensorLayout::elems_per_stick)
-      .def(py::self == py::self)  // NOSONAR
+      .def(py::self == py::self)
       .def("__hash__",
            [](const spyre::SpyreTensorLayout& c) {
              return std::hash<spyre::SpyreTensorLayout>{}(c);
