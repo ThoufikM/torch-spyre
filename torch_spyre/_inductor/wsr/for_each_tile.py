@@ -36,7 +36,7 @@ import torch._prims_common as utils
 from torch._higher_order_ops.scan import scan
 from torch.utils._pytree import keystr, tree_leaves, tree_map_with_path
 
-__all__ = ["Gather", "for_each_tile"]
+__all__ = ["Gather", "Slice", "for_each_tile"]
 
 
 @dataclass(frozen=True)
@@ -49,6 +49,23 @@ class Gather:
 
     axis: int
     index: torch.Tensor
+
+
+@dataclass(frozen=True)
+class Slice:
+    """Tile spec for a SLICED operand with its own extent, decoupled from `tile_size`.
+
+    A plain `int` `dims` entry narrows the operand into `tile_size`-wide contiguous
+    views, `tile_size` shared by every such entry in the same `for_each_tile()` call.
+    `Slice(dim, extent)` is the same narrowing, but with its own `extent` -- for an
+    operand that needs a different per-trip width than the rest, e.g. one row of a
+    per-step scale/lookup table alongside operands tiled at a much larger `tile_size`.
+    Trip count is still `shape[dim] // extent`, and must still agree with every other
+    tiled operand's trip count.
+    """
+
+    dim: int
+    extent: int
 
 
 class Kind(enum.Enum):
@@ -90,7 +107,7 @@ class TileSpec:
         return self.tile_size[self.dim] if self.tile_size else 1
 
 
-DimSpec = Union[int, None, Gather]  # noqa: UP007  # `int | None | Gather` needs Gather at runtime
+DimSpec = Union[int, None, Gather, Slice]  # noqa: UP007  # needs runtime presence
 
 
 # CPython 3.12/3.13 C recursion cap on s390x (10000 on x86).
@@ -224,10 +241,34 @@ def _normalize_in_specs(operands, dims, tile_size: int) -> tuple[list[TileSpec],
                 _tile_size_vector(o.shape, axis, tile_size),
                 length // tile_size,
             )
+        elif isinstance(d, Slice):
+            if (
+                not isinstance(d.extent, int)
+                or isinstance(d.extent, bool)
+                or d.extent <= 0
+            ):
+                raise ValueError(
+                    f"for_each_tile() Slice extent for operand {k} must be a "
+                    f"positive int, got {d.extent!r}"
+                )
+            axis = utils.canonicalize_dim(o.ndim, d.dim)
+            length = o.shape[axis]
+            if length % d.extent != 0:
+                raise ValueError(
+                    f"for_each_tile() operand {k} has size {length} along dim "
+                    f"{d.dim}, which is not a multiple of Slice extent={d.extent} "
+                    f"(ragged tiles are not supported)"
+                )
+            spec = TileSpec(
+                Kind.SLICE,
+                axis,
+                _tile_size_vector(o.shape, axis, d.extent),
+                length // d.extent,
+            )
         else:
             raise ValueError(
-                f"for_each_tile() dims entry {k} must be an int, None or Gather, "
-                f"got {d!r}"
+                f"for_each_tile() dims entry {k} must be an int, None, Gather or "
+                f"Slice, got {d!r}"
             )
 
         if num_tiles is None:
