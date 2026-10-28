@@ -242,11 +242,12 @@ def _normalize_in_specs(operands, dims, tile_size: int) -> tuple[list[TileSpec],
                 length // tile_size,
             )
         elif isinstance(d, Slice):
-            if (
+            bad_extent = (
                 not isinstance(d.extent, int)
                 or isinstance(d.extent, bool)
                 or d.extent <= 0
-            ):
+            )
+            if bad_extent:
                 raise ValueError(
                     f"for_each_tile() Slice extent for operand {k} must be a "
                     f"positive int, got {d.extent!r}"
@@ -371,11 +372,16 @@ def for_each_tile(
         operands: flat sequence of every input -- sliced, gathered and invariant.
         dims: per-operand tile spec as a tuple, or a single spec broadcast to all of
             them. ``int d`` slices the operand into ``tile_size``-wide contiguous views
-            along ``d``; ``None`` passes it whole every step; ``Gather(axis, index)``
-            takes one pool row per step.
-        tile_size: the tile's size along each tiled axis. The loop's trip count is
-            derived: ``shape[dim] // tile_size`` per sliced operand, ``len(index)`` per
-            gathered one. All of them must agree.
+            along ``d``, ``tile_size`` shared by every such entry; ``None`` passes it
+            whole every step; ``Gather(axis, index)`` takes one pool row per step;
+            ``Slice(dim, extent)`` is the same contiguous slicing as ``int d``, but
+            with its own ``extent`` instead of sharing ``tile_size`` -- for an operand
+            that needs a different per-trip width than the rest, e.g. one row of a
+            per-step scale/lookup table alongside operands tiled much wider.
+        tile_size: the tile's size along each tiled axis for every plain ``int d`` dims
+            entry. The loop's trip count is derived: ``shape[dim] // tile_size`` per
+            such sliced operand, ``shape[dim] // extent`` per ``Slice``, ``len(index)``
+            per gathered one. All of them must agree.
         init: carry init (tensor or pytree of tensors); ``None`` means no carry.
         out_dim: ``int d`` lays step ``i``'s tile at ``narrow(d, i*extent, extent)``
             of each returned output leaf. Output tiles may be a tensor or a
