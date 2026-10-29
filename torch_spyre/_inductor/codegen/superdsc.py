@@ -19,7 +19,7 @@ from collections import Counter
 from collections.abc import Iterable
 from typing import Any
 
-from sympy import Expr, Integer, Symbol
+from sympy import Expr, Integer, Mod, Symbol
 from torch._inductor.virtualized import V
 
 from torch_spyre._C import DataFormats, ElementArrangement
@@ -1584,6 +1584,7 @@ def _create_sdsc_tensors(
                 and dev_dim_size != it_dim_size
             ):
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
+                coord_without_offset = dim_coord.as_coeff_Add()[1]
                 offsets[dim] = dim_offset * dim_device_stride
                 # conv2d addresses the difference between device and iteration space sizes
                 # through the window/padding machinery in _conv2d_sdsc_fields, which already
@@ -1592,6 +1593,35 @@ def _create_sdsc_tensors(
                 # that gap and corrupts the generated addressing.
                 #
                 if not _is_conv(op_spec.op) and dev_dim_size > it_dim_size:
+                    backGap[dim] = dev_dim_size - it_dim_size
+                elif (
+                    dim is not stick_dim
+                    and dim not in reduced_dims
+                    and not (_is_conv(op_spec.op) or _is_pool(op_spec.op))
+                    and coord_without_offset.subs(symbol_mapping) == dim
+                    and coord_without_offset in op_spec.iteration_space
+                    and -(
+                        -it_dim_size
+                        // int(op_spec.iteration_space[coord_without_offset][1])
+                    )
+                    <= dev_dim_size
+                ):
+                    # Keep the per-core extent guard above in sync with
+                    # work_division_constraints.overlapping_window_split_domains.
+                    # An overlapping read (``x.unfold(d, 4, 2)``: device row
+                    # ``2*w + k``) gives the window variable a device dimension
+                    # smaller than its range; it spills into the next outer
+                    # dimension. The backend lays dimensions out by iteration
+                    # extent, so shrink this one back to its physical size with
+                    # a negative backGap, or every outer stride is scaled by
+                    # it/dev. Only when the work division leaves at most
+                    # ``dev_dim_size`` values per core (see
+                    # overlapping_window_split_domains): the backend also caps
+                    # in-core iteration at the layout extent, so no core
+                    # iterates into the gap (issue #5347). Otherwise the
+                    # division pins the overlapping outer variable to one value
+                    # per core instead and the iteration-extent layout is
+                    # already exact.
                     backGap[dim] = dev_dim_size - it_dim_size
                 # Overlapping views can iterate beyond an aligned physical
                 # axis (e.g. unfold's window is wider than its step). Core
@@ -2484,7 +2514,13 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                     continue
                 padded_it_size = sdsc_iteration_space[dim_sym]
                 dev_dim_size = op_spec_arg.device_size[coord_idx]
-                if dev_dim_size < padded_it_size:
+                # The earlier negative gap describes an overlapping read, not
+                # restickify padding. Preserve it when the padded space is
+                # revisited here, or outer strides become inflated again.
+                if (
+                    dev_dim_size < padded_it_size
+                    and sdsc_arg.backGap.get(dim_sym, 0) >= 0
+                ):
                     sdsc_arg.backGap[dim_sym] = padded_it_size - dev_dim_size
         for dim in padding:
             if dim_splits[dim] != 1:
@@ -2601,10 +2637,28 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     # Every non-unit dimension must already have a final assignment.
     mapping_dims = tuple(sdsc_iteration_space)
     if is_relayout:
+        operation_cores = num_cores
         num_cores = max(
             num_cores,
             *(arg.work_division.num_cores or 1 for arg in args if arg.work_division),
         )
+        if num_cores != operation_cores:
+            # A contraction must schedule every source core. Repeat the
+            # operation's destination frame within its original domain; the
+            # per-tensor maps below keep the exact source and destination
+            # domains. Example: with 16 output row slices, source core 16 must
+            # not become row 16.
+            # Core-domain admission rejects contraction when
+            # lx_extended_ownership is OFF. This frame patch relies on that
+            # earlier gate; it has no separate flag check.
+            # Explicit core domains:
+            # https://github.com/torch-spyre/torch-spyre/issues/5716
+            core_id_to_work_slice = {
+                dim: owner.xreplace(
+                    {Symbol("core_id"): Mod(Symbol("core_id"), operation_cores)}
+                )
+                for dim, owner in core_id_to_work_slice.items()
+            }
     for dim in mapping_dims:
         if dim not in core_id_to_work_slice:
             if int(dim_splits[dim]) != 1:
